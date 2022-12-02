@@ -1,18 +1,22 @@
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler, QuantileTransformer
+from sklearn.preprocessing import (StandardScaler, MinMaxScaler, MaxAbsScaler, RobustScaler, QuantileTransformer,
+                                   SplineTransformer, PowerTransformer)
 import numpy as np
 import json
 
 scaler_objs = {"StandardScaler": StandardScaler,
                "MinMaxScaler": MinMaxScaler,
                "RobustScaler": RobustScaler,
+               "MaxAbsScaler": MaxAbsScaler,
+               "SplineTransformer": SplineTransformer,
+               "PowerTransformer": PowerTransformer,
                "QuantileTransformer": QuantileTransformer}
 
 
 def save_scaler(scaler, scaler_file):
     """
-    Save
+    Save a scikit learn scaler object to json
 
-    :param scaler:
+    :param scaler: scikit-learn scaler object
     :param scaler_file:
     :return:
     """
