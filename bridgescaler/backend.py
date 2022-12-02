@@ -2,6 +2,7 @@ from sklearn.preprocessing import (StandardScaler, MinMaxScaler, MaxAbsScaler, R
                                    SplineTransformer, PowerTransformer)
 import numpy as np
 import json
+import pandas as pd
 
 scaler_objs = {"StandardScaler": StandardScaler,
                "MinMaxScaler": MinMaxScaler,
@@ -72,3 +73,15 @@ class NumpyEncoder(json.JSONEncoder):
             return None
 
         return json.JSONEncoder.default(self, obj)
+
+
+def create_synthetic_data():
+    locs = np.array([0, 5, -2, 350.5], dtype=np.float32)
+    scales = np.array([1.0, 10, 0.1, 5000.0])
+    names = ["A", "B", "C", "D"]
+    num_examples = 205
+    x_data_dict = {}
+    for l in range(locs.shape[0]):
+        x_data_dict[names[l]] = np.random.normal(loc=locs[l], scale=scales[l], size=num_examples)
+    x_data = pd.DataFrame(x_data_dict)
+    return x_data
