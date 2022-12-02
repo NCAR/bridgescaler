@@ -24,7 +24,7 @@ def test_scaler_io():
         save_scaler(scaler, "test.json")
         assert exists("test.json")
         loaded_scaler = load_scaler("test.json")
-        assert type(loaded_scaler) == type(scaler_obj)
+        assert type(loaded_scaler) == type(scaler)
         loaded_scaled_data = loaded_scaler.transform(x_data)
         assert np.max(np.abs(x_scaled_data - loaded_scaled_data)) < np.finfo(np.float32).eps, scaler_name + " transform does not match"
     return
