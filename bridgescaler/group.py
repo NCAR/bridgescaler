@@ -102,8 +102,8 @@ class GroupStandardScaler(GroupBaseScaler):
         is_df = hasattr(x, "columns")
         for g in self.group_index_:
             if is_df:
-                self.center_[g] = np.mean(x[self.groups_[g]])
-                self.scale_[g] = np.std(x[self.groups_[g]])
+                self.center_[g] = np.mean(x[self.groups_[g]].values)
+                self.scale_[g] = np.std(x[self.groups_[g]].values)
             else:
                 self.center_[g] = np.mean(x[:, self.groups_[g]])
                 self.scale_[g] = np.std(x[:, self.groups_[g]])
