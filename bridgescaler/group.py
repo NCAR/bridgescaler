@@ -42,14 +42,14 @@ class GroupBaseScaler:
         if groups is None:
             if hasattr(x, "columns"):
                 self.groups_ = list(x.columns)
-                self.x_columns_ = x.columns
+                self.x_columns_ = list(x.columns)
             else:
                 self.groups_ = list(range(x.shape[1]))
                 self.x_columns_ = list(range(x.shape[1]))
         else:
             self.groups_ = groups
             if hasattr(x, "columns"):
-                self.x_columns_ = x.columns
+                self.x_columns_ = list(x.columns)
             else:
                 self.x_columns_ = list(range(x.shape[1]))
         self.group_index_ = np.arange(len(self.groups_))
