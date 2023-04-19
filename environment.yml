@@ -9,5 +9,5 @@ dependencies:
   - scikit-learn
   - pyarrow
   - pytest
-  pip:
+  - pip:
     - .
