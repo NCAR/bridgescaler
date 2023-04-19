@@ -1,7 +1,6 @@
 from bridgescaler import save_scaler, load_scaler
 from bridgescaler.backend import create_synthetic_data
 import numpy as np
-import pandas as pd
 import os
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, QuantileTransformer
 scaler_objs = {"StandardScaler": StandardScaler,
