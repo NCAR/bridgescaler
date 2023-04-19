@@ -47,10 +47,10 @@ def load_scaler(scaler_file):
     scaler = scaler_objs[scaler_params["type"]]()
     del scaler_params["type"]
     for k, v in scaler_params.items():
-        if type(v) == list:
-            setattr(scaler, k, np.array(scaler_params[k]))
+        if type(v) == dict:
+            setattr(scaler, k, np.array(v['data'], dtype=v['dtype']).reshape(v['shape']))
         else:
-            setattr(scaler, k, scaler_params[k])
+            setattr(scaler, k, v)
     return scaler
 
 
@@ -71,7 +71,8 @@ class NumpyEncoder(json.JSONEncoder):
             return {'real': obj.real, 'imag': obj.imag}
 
         elif isinstance(obj, (np.ndarray,)):
-            return obj.tolist()
+            return {'object': 'ndarray', 'dtype': obj.dtype.str, 'shape': list(obj.shape),
+                    'data': obj.ravel().tolist()}
 
         elif isinstance(obj, (np.bool_)):
             return bool(obj)
