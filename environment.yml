@@ -6,8 +6,8 @@ dependencies:
   - pip
   - numpy
   - pandas
-  - xarray
   - scikit-learn
-  - netcdf4
   - pyarrow
   - pytest
+  - pip:
+    - .

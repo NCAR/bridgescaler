@@ -8,11 +8,11 @@ class GroupBaseScaler:
         self.group_index_ = None
         self.x_columns_ = None
 
-    def fit(self, x, y=None, groups=None):
+    def fit(self, x, groups=None):
         self._fit(x, groups)
         return self
 
-    def fit_transform(self, x, y=None, groups=None):
+    def fit_transform(self, x, groups=None):
         self._fit(x, groups)
         return self.transform(x)
 
@@ -95,7 +95,7 @@ class GroupStandardScaler(GroupBaseScaler):
         self.scale_ = None
         super().__init__()
 
-    def _fit(self, x, groups):
+    def _fit(self, x, groups=None):
         self.set_groups(x, groups)
         self.center_ = np.zeros(self.group_index_.shape)
         self.scale_ = np.zeros(self.group_index_.shape)
