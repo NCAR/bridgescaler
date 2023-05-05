@@ -121,7 +121,8 @@ class GroupMinMaxScaler(GroupBaseScaler):
     """
     Group version of MinMaxScaler
     """
-    def __init__(self):
+    def __init__(self, feature_range=(0, 1)):
+        self.feature_range = feature_range
         self.mins_ = None
         self.maxes_ = None
         GroupBaseScaler.__init__(self)
@@ -131,16 +132,23 @@ class GroupMinMaxScaler(GroupBaseScaler):
         self.set_groups(x, groups)
         self.mins_ = np.zeros(self.group_index_.shape)
         self.maxes_ = np.zeros(self.group_index_.shape)
+        is_df = hasattr(x, "columns")
         for g in self.group_index_:
-            self.mins_[g] = np.min(x[self.groups_[g]])
-            self.maxes_[g] = np.max(x[self.groups_[g]])
+            if is_df:
+                self.mins_[g] = np.min(x[self.groups_[g]].values)
+                self.maxes_[g] = np.max(x[self.groups_[g]].values)
+            else:
+                self.mins_[g] = np.min(x[:, self.groups_[g]])
+                self.maxes_[g] = np.max(x[:, self.groups_[g]])
         return
 
     def _transform_column(self, x_column, group_index):
-        return (x_column - self.mins_[group_index]) / (self.maxes_[group_index] - self.mins_[group_index])
+        x_normed = (x_column - self.mins_[group_index]) / (self.maxes_[group_index] - self.mins_[group_index])
+        return x_normed * (self.feature_range[1] - self.feature_range[0]) + self.feature_range[0]
 
     def _inverse_transform_column(self, x_column, group_index):
-        return x_column * (self.maxes_[group_index] - self.mins_[group_index]) + self.mins_[group_index]
+        x_normed = (x_column - self.feature_range[0]) / (self.feature_range[1] - self.feature_range[0])
+        return x_normed * (self.maxes_[group_index] - self.mins_[group_index]) + self.mins_[group_index]
 
 
 class GroupRobustScaler(GroupBaseScaler):
@@ -174,6 +182,9 @@ class GroupRobustScaler(GroupBaseScaler):
 
     def _inverse_transform_column(self, x_column, group_index):
         return x_column * self.scale_[group_index] + self.center_[group_index]
+
+
+
 
 
 
