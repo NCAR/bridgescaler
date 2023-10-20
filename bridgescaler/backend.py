@@ -1,7 +1,8 @@
 from sklearn.preprocessing import (StandardScaler, MinMaxScaler, MaxAbsScaler, RobustScaler, QuantileTransformer,
                                    SplineTransformer, PowerTransformer)
 from bridgescaler.group import GroupStandardScaler, GroupRobustScaler, GroupMinMaxScaler
-from bridgescaler.deep import DeepStandardScaler, DeepMinMaxScaler
+from bridgescaler.deep import DeepStandardScaler, DeepMinMaxScaler, DeepQuantileTransformer
+from bridgescaler.distributed import DStandardScaler
 import numpy as np
 import json
 import pandas as pd
@@ -17,7 +18,9 @@ scaler_objs = {"StandardScaler": StandardScaler,
                "GroupRobustScaler": GroupRobustScaler,
                "GroupMinMaxScaler": GroupMinMaxScaler,
                "DeepStandardScaler": DeepStandardScaler,
-               "DeepMinMaxScaler": DeepMinMaxScaler}
+               "DeepMinMaxScaler": DeepMinMaxScaler,
+               "DeepQuantileTransformer": DeepQuantileTransformer,
+               "DStandardScaler": DStandardScaler}
 
 
 def save_scaler(scaler, scaler_file):
