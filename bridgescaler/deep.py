@@ -97,7 +97,7 @@ class DeepQuantileTransformer(object):
     def transform(self, x):
         x_transformed = np.zeros(x.shape, dtype=x.dtype)
         for v in range(x.shape[-1]):
-            x_transformed[..., v] = self._transform_col_2(x[..., v].ravel(), v).reshape(x[..., v].shape)
+            x_transformed[..., v] = self._transform_col(x[..., v].ravel(), v).reshape(x[..., v].shape)
         return x_transformed
 
     def fit_transform(self, x):
