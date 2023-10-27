@@ -2,7 +2,7 @@ from sklearn.preprocessing import (StandardScaler, MinMaxScaler, MaxAbsScaler, R
                                    SplineTransformer, PowerTransformer)
 from bridgescaler.group import GroupStandardScaler, GroupRobustScaler, GroupMinMaxScaler
 from bridgescaler.deep import DeepStandardScaler, DeepMinMaxScaler, DeepQuantileTransformer
-from bridgescaler.distributed import DStandardScaler
+from bridgescaler.distributed import DStandardScaler, DMinMaxScaler
 import numpy as np
 import json
 import pandas as pd
@@ -20,7 +20,8 @@ scaler_objs = {"StandardScaler": StandardScaler,
                "DeepStandardScaler": DeepStandardScaler,
                "DeepMinMaxScaler": DeepMinMaxScaler,
                "DeepQuantileTransformer": DeepQuantileTransformer,
-               "DStandardScaler": DStandardScaler}
+               "DStandardScaler": DStandardScaler,
+               "DMinMaxScaler": DMinMaxScaler}
 
 
 def save_scaler(scaler, scaler_file):
