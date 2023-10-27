@@ -132,7 +132,7 @@ x_2 = np.random.normal(1, 3.5, (25, 5))
 
 dss_1.fit(x_1)
 dss_2.fit(x_2)
-dss_combined = np.sum([x_1, x_2])
+dss_combined = np.sum([dss_1, dss_2])
 
 dss_combined.transform(x_1)
 
