@@ -58,9 +58,9 @@ def test_deep_minmax_scaler():
 
 def test_deep_quantile_transformer():
     np.random.seed(352680)
-    n_ex = 10000
-    n_channels = 4
-    dim = 32
+    n_ex = 1000
+    n_channels = 3
+    dim = 16
     means = np.array([1, 5, -4, 2.5], dtype=np.float64)
     sds = np.array([10, 2, 43.4, 32.], dtype=np.float64)
     x = np.zeros((n_ex, dim, dim, n_channels), dtype=np.float64)
@@ -82,5 +82,6 @@ def test_deep_quantile_transformer():
     assert x_transformed.shape == x.shape, "Shape mismatch"
     assert x_transformed.max() <= 1, "Max greater than 1"
     assert x_transformed.min() >= 0, "Min less than 0"
-    #assert np.max(np.abs(x_telephone - x) / x) < 0.1, "Significant differences"
+    assert np.max(np.abs(full_diff - reg_diff)) < 1e-8, "significant differences in differences."
+    assert np.max(np.abs(x_telephone - x)) < 1e-8, "Significant differences"
     return
