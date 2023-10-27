@@ -3,7 +3,8 @@ import numpy as np
 
 class DeepStandardScaler(object):
     """
-
+    Calculate standard scaler scores on an arbitrarily dimensional dataset as long as the last dimension is
+    the variable dimension.
 
     """
     def __init__(self):
@@ -16,7 +17,7 @@ class DeepStandardScaler(object):
         self.sd_ = np.zeros(x.shape[-1], dtype=x.dtype)
         for v in range(x.shape[-1]):
             self.mean_[v] = np.mean(x[..., v])
-            self.sd_[v] = np.std(x[..., v])
+            self.sd_[v] = np.std(x[..., v], ddof=1)
 
     def transform(self, x):
         x_transformed = np.zeros(x.shape, dtype=x.dtype)
