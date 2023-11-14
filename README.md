@@ -88,10 +88,11 @@ x_transformed = group_scaler.fit_transform(data, groups=groups)
 deviation for that group.
 
 ### Deep Scaler
-The deep scalers are designed to scale 2 or 3 dimensional fields input into a 
+The deep scalers are designed to scale 2 or 3-dimensional fields input into a 
 deep learning model such as a convolutional neural network. The scalers assume
 that the last dimension is the channel/variable dimension and scales the values accordingly.
-The scalers can support 2D or 3D patches with no change in code structure.
+The scalers can support 2D or 3D patches with no change in code structure. Support is provided for
+DeepStandardScaler and DeepQuantileTransformer.
 
 Example:
 ```python
@@ -109,4 +110,30 @@ for chan in range(n_channels):
 dss = DeepStandardScaler()
 dss.fit(x)
 x_transformed = dss.transform(x)
+```
+
+### Distributed Scaler
+The distributed scalers allow you to calculate scaling
+parameters on different subsets of a dataset and then combine the scaling factors
+together to get representative scaling values for the full dataset. Distributed
+Standard Scalers MinMaxScalers have been implemented and work with both tabular
+and muliti-dimensional patch data.
+
+Example:
+```python
+from bridgescaler.distributed import DStandardScaler
+import numpy as np
+
+dss_1 = DStandardScaler()
+dss_2 = DStandardScaler()
+
+x_1 = np.random.normal(0, 2.2, (20, 5))
+x_2 = np.random.normal(1, 3.5, (25, 5))
+
+dss_1.fit(x_1)
+dss_2.fit(x_2)
+dss_combined = np.sum([dss_1, dss_2])
+
+dss_combined.transform(x_1)
+
 ```
