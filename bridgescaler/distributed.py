@@ -158,19 +158,19 @@ class DQuantileTransformer(object):
         if not self._fit:
             # The number of centroids may vary depending on the distribution of each input variable.
             # The extra spots at the end are padded with nans.
-            self.centroids = np.ones((x.shape[-1], 2, self.max_merged_centroids)) * np.nan
+            self.centroids = np.ones((x.shape[-1], self.max_merged_centroids, 2)) * np.nan
             for i in range(x.shape[-1]):
                 td_obj = TDigest.compute(x[..., i].ravel(), w=weight, compression=self.max_merged_centroids)
                 td_obj.force_merge()
-                self.centroids[i, :, :td_obj._num_merged] = td_obj.get_centroids()
+                self.centroids[i, :td_obj._num_merged] = td_obj.get_centroids()
         else:
             td_objs = self.to_digests()
-            new_centroids = np.ones((x.shape[-1], 2, self.max_merged_centroids)) * np.nan
+            new_centroids = np.ones((x.shape[-1], self.max_merged_centroids, 2)) * np.nan
             for i, td_obj in enumerate(td_objs):
                 new_td_obj = TDigest.compute(x[..., i].ravel(), w=weight, compression=self.max_merged_centroids)
                 combined_td_obj = td_obj + new_td_obj
                 combined_td_obj.force_merge()
-                new_centroids[i, :, :combined_td_obj._num_merged] = combined_td_obj.get_centroids()
+                new_centroids[i, :combined_td_obj._num_merged] = combined_td_obj.get_centroids()
             self.centroids = new_centroids
         return
 
@@ -190,9 +190,9 @@ class DQuantileTransformer(object):
         return td_objs
 
     def to_centroids(self, td_objs):
-        centroids = np.ones((len(td_objs), 2, self.max_merged_centroids)) * np.nan
+        centroids = np.ones((len(td_objs), self.max_merged_centroids, 2)) * np.nan
         for i in range(len(td_objs)):
-            centroids[i, :, :td_objs[i]._num_merged] = td_objs[i].get_centroids()
+            centroids[i, :td_objs[i]._num_merged] = td_objs[i].get_centroids()
         return centroids
 
 
@@ -223,7 +223,7 @@ class DQuantileTransformer(object):
         for i in range(len(td_objs)):
             combined_td_obj = td_objs[i] + other_td_objs[i]
             combined_td_obj.force_merge()
-            combined_centroids[i, :, :combined_td_obj._num_merged] = combined_td_obj.get_centroids()
+            combined_centroids[i, :combined_td_obj._num_merged] = combined_td_obj.get_centroids()
         new_dquantile = DQuantileTransformer(max_merged_centroids=self.max_merged_centroids,
                                              x_columns=self.x_columns,
                                              centroids=combined_centroids)
