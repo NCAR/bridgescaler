@@ -172,6 +172,7 @@ class DQuantileTransformer(object):
                 combined_td_obj.force_merge()
                 new_centroids[i, :combined_td_obj._num_merged] = combined_td_obj.get_centroids()
             self.centroids = new_centroids
+        self._fit = True
         return
 
     def to_digests(self):
@@ -184,8 +185,8 @@ class DQuantileTransformer(object):
         assert self._fit, "Must call fit() before calling to_digests()"
         td_objs = []
         for i in range(self.centroids.shape[0]):
-            centroid_len = np.where(np.isnan(self.centroids[i, 0]))[0].min()
-            td_objs.append(TDigest.of_centroids(self.centroids[i, :, centroid_len],
+            centroid_len = np.where(np.isnan(self.centroids[i, :, 0]))[0].min()
+            td_objs.append(TDigest.of_centroids(self.centroids[i, :centroid_len],
                                                 compression=self.max_merged_centroids))
         return td_objs
 
@@ -202,7 +203,7 @@ class DQuantileTransformer(object):
         td_objs = self.to_digests()
         x_transformed = np.zeros(x.shape, dtype=x.dtype)
         for i in range(x.shape[-1]):
-            x_transformed[..., i] = td_objs[i].cdf(x[..., i])
+            x_transformed[..., i] = np.reshape(td_objs[i].cdf(x[..., i].ravel()), x[..., i].shape)
         return x_transformed
 
     def inverse_transform(self, x):
@@ -211,7 +212,7 @@ class DQuantileTransformer(object):
         x_transformed = np.zeros(x.shape, dtype=x.dtype)
         td_objs = self.to_digests()
         for i in range(x.shape[-1]):
-            x_transformed[..., i] = td_objs[i].inverse_cdf(x[..., i])
+            x_transformed[..., i] = np.reshape(td_objs[i].inverse_cdf(x[..., i].ravel()), x[..., i].shape)
         return x_transformed
 
     def __add__(self, other):

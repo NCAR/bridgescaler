@@ -52,7 +52,6 @@ def test_dquantile_scaler_numpy():
             data4d[..., i] = np.random.normal(loc=means[i], scale=sds[i], size=(n_examples[n], tile_width, tile_width))
         datasets_2d.append(data2d)
         datasets_4d.append(data4d)
-    all_ds_2d = np.vstack(datasets_2d)
     dsses_2d = []
     dsses_4d = []
     for n in range(n_examples.size):
@@ -60,6 +59,10 @@ def test_dquantile_scaler_numpy():
         dsses_2d[-1].fit(datasets_2d[n])
         dsses_4d.append(DQuantileTransformer())
         dsses_4d[-1].fit(datasets_4d[n])
+        ds_2d_transformed = dsses_2d[-1].transform(datasets_2d[n])
+        ds_4d_transformed = dsses_4d[-1].transform(datasets_4d[n])
+        assert ds_2d_transformed.max() <= 1, "Quantile transform > 1"
+        assert ds_4d_transformed.max() <= 1, "Quantile transform > 1"
     return
 
 
