@@ -10,4 +10,5 @@ dependencies:
   - pyarrow
   - pytest
   - pip:
+    - pytdigest
     - .
