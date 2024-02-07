@@ -87,8 +87,7 @@ class GroupStandardScaler(GroupBaseScaler):
     groups = [["a", "b"], ["c", "d"], "e"]
     ```
     "a" and "b" are a single group and all values of both will be included when calculating the mean and standard
-     deviation for that group.
-
+    deviation for that group.
     """
     def __init__(self):
         self.center_ = None
