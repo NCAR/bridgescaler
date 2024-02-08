@@ -44,6 +44,7 @@ class DStandardScaler(object):
                 self.mean_x_[i] = combined_mean
                 self.var_x_[i] = weighted_var + var_correction
                 self.n_ += new_n
+        self.fit_ = True
 
     def transform(self, x):
         assert self.fit_, "Scaler has not been fit."
@@ -84,7 +85,7 @@ class DMinMaxScaler(object):
     the mins and maxes as a reduction step.
 
     """
-    def ___init__(self):
+    def __init__(self):
         self.max_x_ = None
         self.min_x_ = None
         self.fit_ = False
@@ -103,11 +104,12 @@ class DMinMaxScaler(object):
             for i in range(x.shape[-1]):
                 self.max_x_[i] = np.max(xv[..., i])
                 self.min_x_[i] = np.min(xv[..., i])
-            self.fit_ = True
+
         else:
             for i in range(x.shape[-1]):
                 self.max_x_[i] = np.maximum(self.max_x_[i], np.max(xv[..., i]))
                 self.min_x_[i] = np.minimum(self.min_x_[i], np.min(xv[..., i]))
+        self.fit_ = True
 
     def transform(self, x):
         assert self.fit_, "Scaler has not been fit."
@@ -124,6 +126,9 @@ class DMinMaxScaler(object):
     def fit_transform(self, x):
         self.fit(x)
         return self.transform(x)
+
+    def get_scales(self):
+        return self.min_x_, self.max_x_
 
     def __add__(self, other):
         assert type(other) is DMinMaxScaler, "Input is not DMinMaxScaler"
@@ -196,7 +201,6 @@ class DQuantileTransformer(object):
             centroids[i, :td_objs[i]._num_merged] = td_objs[i].get_centroids()
         return centroids
 
-
     def transform(self, x):
         assert self._fit, "Scaler has not been fit."
         assert x.shape[-1] == len(self.x_columns), "New data has a different number of columns than current scaler"
@@ -205,6 +209,10 @@ class DQuantileTransformer(object):
         for i in range(x.shape[-1]):
             x_transformed[..., i] = np.reshape(td_objs[i].cdf(x[..., i].ravel()), x[..., i].shape)
         return x_transformed
+
+    def fit_transform(self, x, weight=None):
+        self.fit(x, weight=weight)
+        return self.transform(x)
 
     def inverse_transform(self, x):
         assert self._fit, "Scaler has not been fit."
