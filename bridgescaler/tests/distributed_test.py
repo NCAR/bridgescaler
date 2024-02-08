@@ -1,5 +1,7 @@
 from bridgescaler.distributed import DStandardScaler, DMinMaxScaler, DQuantileTransformer
+from bridgescaler import save_scaler, load_scaler
 import numpy as np
+import os
 
 
 def test_dstandard_scaler():
@@ -36,6 +38,7 @@ def test_dstandard_scaler():
     assert np.max(np.abs(mean_2d - all_ds_2d.mean(axis=0))) < 1e-8, "significant difference in means"
     assert np.max(np.abs(var_2d - all_ds_2d.var(axis=0, ddof=1))) < 1e-5, "significant difference in variances"
 
+
 def test_dminmax_scaler():
     np.random.seed(34325)
     means = np.array([0, 5.3, -2.421, 21456.3, 1.e-5])
@@ -70,6 +73,7 @@ def test_dminmax_scaler():
     assert np.max(np.abs(min_2d - all_ds_2d.min(axis=0))) < 1e-8, "significant difference in means"
     assert np.max(np.abs(max_2d - all_ds_2d.max(axis=0))) < 1e-8, "significant difference in variances"
 
+
 def test_dquantile_scaler_numpy():
     np.random.seed(34325)
     means = np.array([0, 5.3, -2.421, 21456.3, 1.e-5])
@@ -97,6 +101,12 @@ def test_dquantile_scaler_numpy():
         ds_4d_transformed = dsses_4d[-1].transform(datasets_4d[n])
         assert ds_2d_transformed.max() <= 1, "Quantile transform > 1"
         assert ds_4d_transformed.max() <= 1, "Quantile transform > 1"
+        save_scaler(dsses_2d[-1], "scaler.json")
+        new_scaler = load_scaler("scaler.json")
+        os.remove("scaler.json")
+        assert np.nanargmax(np.abs((new_scaler.centroids - dsses_2d[-1].centroids))) == 0, "Differences in scaler centroid values after loading"
+    combined_scaler = np.sum(dsses_2d)
+    assert np.nansum(combined_scaler.centroids[0, :, 1]) == n_examples.sum(), "Summing did not work properly."
     return
 
 
