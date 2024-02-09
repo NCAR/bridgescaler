@@ -148,7 +148,7 @@ class DStandardScaler(DBaseScaler):
         return self.mean_x_, self.var_x_
 
     def __add__(self, other):
-        assert type(other) == DStandardScaler, "Input is not DStandardScaler"
+        assert type(other) is DStandardScaler, "Input is not DStandardScaler"
         assert np.all(other.x_columns_ == self.x_columns_), "Scaler columns do not match."
         current = copy(self)
         current.mean_x_ = (self.n_ * self.mean_x_ + other.n_ * other.mean_x_) / (self.n_ + other.n_)
