@@ -9,5 +9,8 @@ dependencies:
   - scikit-learn
   - pyarrow
   - pytest
+  - sphinx
   - pip:
+    - pytdigest
+    - sphinx-book-theme
     - .

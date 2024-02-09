@@ -2,7 +2,7 @@ from sklearn.preprocessing import (StandardScaler, MinMaxScaler, MaxAbsScaler, R
                                    SplineTransformer, PowerTransformer)
 from bridgescaler.group import GroupStandardScaler, GroupRobustScaler, GroupMinMaxScaler
 from bridgescaler.deep import DeepStandardScaler, DeepMinMaxScaler, DeepQuantileTransformer
-from bridgescaler.distributed import DStandardScaler, DMinMaxScaler
+from bridgescaler.distributed import DStandardScaler, DMinMaxScaler, DQuantileTransformer
 import numpy as np
 import json
 import pandas as pd
@@ -21,16 +21,16 @@ scaler_objs = {"StandardScaler": StandardScaler,
                "DeepMinMaxScaler": DeepMinMaxScaler,
                "DeepQuantileTransformer": DeepQuantileTransformer,
                "DStandardScaler": DStandardScaler,
-               "DMinMaxScaler": DMinMaxScaler}
+               "DMinMaxScaler": DMinMaxScaler,
+               "DQuantileTransformer": DQuantileTransformer}
 
 
 def save_scaler(scaler, scaler_file):
     """
-    Save a scikit learn scaler object to json
+    Save a scikit-learn or bridgescaler scaler object to json format.
 
-    :param scaler: scikit-learn scaler object
-    :param scaler_file:
-    :return:
+    :param scaler: scikit-learn-style scaler object
+    :param scaler_file: path to json file where scaler information is stored.
     """
     scaler_params = scaler.__dict__
     scaler_params["type"] = str(type(scaler))[1:-2].split(".")[-1]
@@ -41,10 +41,10 @@ def save_scaler(scaler, scaler_file):
 
 def load_scaler(scaler_file):
     """
-    Initialize scikit-learn scaler from saved json file.
+    Initialize scikit-learn or bridgescaler scaler from saved json file.
 
-    :param scaler_file:
-    :return:
+    :param scaler_file: path to json file.
+    :return: scaler object.
     """
     with open(scaler_file, "r") as file_obj:
         scaler_params = json.load(file_obj)

@@ -1,4 +1,5 @@
 pandas
 numpy
 scikit-learn>=1.0
-
+pytdigest
+xarray

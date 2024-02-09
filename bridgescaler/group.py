@@ -1,12 +1,60 @@
 import numpy as np
-from copy import deepcopy
+from copy import copy, deepcopy
 
 
-class GroupBaseScaler:
+class GroupBaseScaler(object):
     def __init__(self):
         self.groups_ = None
         self.group_index_ = None
         self.x_columns_ = None
+
+    def extract_x_columns(self, x):
+        """
+        Extract the variable names to be transformed from x depending on if x is a pandas DataFrame, an
+        xarray DataArray, or a numpy array. All of these assume that the columns are in the last dimension.
+        If x is an xarray DataArray, there should be a coorindate variable with the same name as the last dimension
+        of the DataArray being transformed.
+
+        Args:
+            x (Union[pandas.DataFrame, xarray.DataArray, numpy.ndarray]): array of values to be transformed.
+
+        Returns:
+            xv (numpy.ndarray): Array of values to be transformed.
+        """
+        if hasattr(x, "columns"):
+            self.x_columns_ = x.columns
+            xv = x.values
+        elif hasattr(x, "coords"):
+            var_dim = x.dims[-1]
+            self.x_columns_ = x.coords[var_dim].values
+            xv = x.values
+        else:
+            self.x_columns_ = np.arange(x.shape[-1])
+            xv = x
+        return xv
+
+    @staticmethod
+    def package_transformed_x(x_transformed, x):
+        """
+        Repackaged a transformed numpy array into the same datatype as the original x, including
+        all metadata.
+
+        Args:
+            x_transformed (numpy.ndarray): array after being transformed or inverse transformed
+            x (Union[pandas.DataFrame, xarray.DataArray, numpy.ndarray]):
+
+        Returns:
+
+        """
+        if hasattr(x, "columns"):
+            x_packaged = copy(x)
+            x_packaged.loc[:, :] = x_transformed
+        elif hasattr(x, "coords"):
+            x_packaged = copy(x)
+            x_packaged[:] = x_transformed
+        else:
+            x_packaged = x_transformed
+        return x_packaged
 
     def fit(self, x, groups=None):
         self._fit(x, groups)
@@ -57,9 +105,9 @@ class GroupBaseScaler:
     def find_group(self, var_name):
         group_index = -1
         for g, group in enumerate(self.groups_):
-            if type(group) != list and var_name == group:
+            if type(group) is not list and var_name == group:
                 group_index = g
-            elif var_name in group:
+            elif type(group) is list and var_name in group:
                 group_index = g
         assert group_index >= 0, var_name + " not found in groups."
         return group_index
@@ -87,8 +135,7 @@ class GroupStandardScaler(GroupBaseScaler):
     groups = [["a", "b"], ["c", "d"], "e"]
     ```
     "a" and "b" are a single group and all values of both will be included when calculating the mean and standard
-     deviation for that group.
-
+    deviation for that group.
     """
     def __init__(self):
         self.center_ = None
