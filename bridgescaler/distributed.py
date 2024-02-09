@@ -1,6 +1,7 @@
 import numpy as np
 from copy import copy
 from pytdigest import TDigest
+from scipy.stats import norm, logistic
 
 
 class DStandardScaler(object):
@@ -147,9 +148,14 @@ class DQuantileTransformer(object):
     to create a combined quantile distribution, enabling map-reduce-style distributed calculations of quantiles
     across large number of files. The same object can also be fit multiple times to compile quantiles serially
     but with lower memory usage.
+
+    Args:
+        max_merged_centroids (int): Maximum number of centroids in TDigest
+        distribution (str): Output distribution of transform. Options are "uniform" (default), "normal", and "logistic".
     """
-    def __init__(self, max_merged_centroids=1000, x_columns=None, centroids=None):
+    def __init__(self, max_merged_centroids=1000, distribution="uniform", x_columns=None, centroids=None):
         self.max_merged_centroids = max_merged_centroids
+        self.distribution = distribution
         self._fit = False
         self.x_columns = x_columns
         self.centroids = centroids
@@ -208,6 +214,10 @@ class DQuantileTransformer(object):
         x_transformed = np.zeros(x.shape, dtype=x.dtype)
         for i in range(x.shape[-1]):
             x_transformed[..., i] = np.reshape(td_objs[i].cdf(x[..., i].ravel()), x[..., i].shape)
+        if self.distribution == "normal":
+            x_transformed = norm.ppf(x_transformed)
+        elif self.distribution == "logistic":
+            x_transformed = logistic.ppf(x_transformed)
         return x_transformed
 
     def fit_transform(self, x, weight=None):
@@ -221,6 +231,10 @@ class DQuantileTransformer(object):
         td_objs = self.to_digests()
         for i in range(x.shape[-1]):
             x_transformed[..., i] = np.reshape(td_objs[i].inverse_cdf(x[..., i].ravel()), x[..., i].shape)
+        if self.distribution == "normal":
+            x_transformed = norm.cdf(x_transformed)
+        elif self.distribution == "logistic":
+            x_transformed = logistic.cdf(x_transformed)
         return x_transformed
 
     def __add__(self, other):
