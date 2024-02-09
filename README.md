@@ -1,6 +1,6 @@
 # bridgescaler
-Bridge your scikit-learn scaler parameters between Python sessions and users.
-Bridgescaler allows you to save the properties of a scikit-learn scaler object
+Bridge your scikit-learn-style scaler parameters between Python sessions and users.
+Bridgescaler allows you to save the properties of a scikit-learn-style scaler object
 to a json file, and then repopulate a new scaler object with the same properties.
 
 
@@ -8,6 +8,8 @@ to a json file, and then repopulate a new scaler object with the same properties
 * scikit-learn
 * numpy
 * pandas
+* xarray
+* pydigest
 
 ## Installation
 For a stable version of bridgescaler, you can install from PyPI.
@@ -62,6 +64,30 @@ save_scaler(scaler, filename)
 # create new StandardScaler from json file information.
 new_scaler = load_scaler(filename) # new_scaler is a StandardScaler object
 ```
+### Distributed Scaler
+The distributed scalers allow you to calculate scaling
+parameters on different subsets of a dataset and then combine the scaling factors
+together to get representative scaling values for the full dataset. Distributed
+Standard Scalers, MinMax Scalers, and Quantile Transformers have been implemented and work with both tabular
+and muliti-dimensional patch data in numpy, pandas DataFrame, and xarray DataArray formats.
+
+Example:
+```python
+from bridgescaler.distributed import DStandardScaler
+import numpy as np
+
+dss_1 = DStandardScaler()
+dss_2 = DStandardScaler()
+
+x_1 = np.random.normal(0, 2.2, (20, 5))
+x_2 = np.random.normal(1, 3.5, (25, 5))
+
+dss_1.fit(x_1)
+dss_2.fit(x_2)
+dss_combined = np.sum([dss_1, dss_2])
+
+dss_combined.transform(x_1)
+```
 
 ### Group Scaler
 The group scalers use the same scaling parameters for a group of similar
@@ -110,30 +136,4 @@ for chan in range(n_channels):
 dss = DeepStandardScaler()
 dss.fit(x)
 x_transformed = dss.transform(x)
-```
-
-### Distributed Scaler
-The distributed scalers allow you to calculate scaling
-parameters on different subsets of a dataset and then combine the scaling factors
-together to get representative scaling values for the full dataset. Distributed
-Standard Scalers MinMaxScalers have been implemented and work with both tabular
-and muliti-dimensional patch data.
-
-Example:
-```python
-from bridgescaler.distributed import DStandardScaler
-import numpy as np
-
-dss_1 = DStandardScaler()
-dss_2 = DStandardScaler()
-
-x_1 = np.random.normal(0, 2.2, (20, 5))
-x_2 = np.random.normal(1, 3.5, (25, 5))
-
-dss_1.fit(x_1)
-dss_2.fit(x_2)
-dss_combined = np.sum([dss_1, dss_2])
-
-dss_combined.transform(x_1)
-
 ```

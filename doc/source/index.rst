@@ -11,8 +11,14 @@ distributed scaling of data for pre-processing of AI and ML models.
 .. toctree::
    :maxdepth: 2
    :caption: Contents:
-  
+
+   index.rst
+   gettingstarted.rst
+   usage.rst
+   distributed.rst
+   group.rst
    modules.rst
+
 
 
 Indices and tables

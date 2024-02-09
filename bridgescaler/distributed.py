@@ -4,39 +4,118 @@ from pytdigest import TDigest
 from scipy.stats import norm, logistic
 
 
-class DStandardScaler(object):
+class DBaseScaler(object):
+    """
+    Base distributed scaler class. Used only to store attributes and methods shared across all distributed
+    scaler subclasses.
+    """
+    def __init__(self):
+        self.x_columns_ = None
+        self._fit = False
+
+    def is_fit(self):
+        return self._fit
+
+    def extract_x_columns(self, x):
+        """
+        Extract the variable names to be transformed from x depending on if x is a pandas DataFrame, an
+        xarray DataArray, or a numpy array. All of these assume that the columns are in the last dimension.
+        If x is an xarray DataArray, there should be a coorindate variable with the same name as the last dimension
+        of the DataArray being transformed.
+
+        Args:
+            x (Union[pandas.DataFrame, xarray.DataArray, numpy.ndarray]): array of values to be transformed.
+
+        Returns:
+            xv (numpy.ndarray): Array of values to be transformed.
+        """
+        if hasattr(x, "columns"):
+            self.x_columns_ = x.columns
+            xv = x.values
+        elif hasattr(x, "coords"):
+            var_dim = x.dims[-1]
+            self.x_columns_ = x.coords[var_dim].values
+            xv = x.values
+        else:
+            self.x_columns_ = np.arange(x.shape[-1])
+            xv = x
+        return xv
+
+    def extract_array(self, x):
+        if hasattr(x, "columns") or hasattr(x, "coords"):
+            xv = x.values
+        else:
+            xv = x
+        return xv
+    
+    @staticmethod
+    def package_transformed_x(x_transformed, x):
+        """
+        Repackaged a transformed numpy array into the same datatype as the original x, including
+        all metadata.
+
+        Args:
+            x_transformed (numpy.ndarray): array after being transformed or inverse transformed
+            x (Union[pandas.DataFrame, xarray.DataArray, numpy.ndarray]):
+
+        Returns:
+
+        """
+        if hasattr(x, "columns"):
+            x_packaged = copy(x)
+            x_packaged.loc[:, :] = x_transformed
+        elif hasattr(x, "coords"):
+            x_packaged = copy(x)
+            x_packaged[:] = x_transformed
+        else:
+            x_packaged = x_transformed
+        return x_packaged
+
+    def fit(self, x, weight=None):
+        pass
+
+    def transform(self, x):
+        pass
+
+    def fit_transform(self, x):
+        pass
+
+    def inverse_transform(self, x):
+        pass
+
+    def __add__(self, other):
+        pass
+
+
+class DStandardScaler(DBaseScaler):
     """
     Distributed version of StandardScaler. You can calculate this map-reduce style by running it on individual
-    data files, return the fitted objects, and then sum them together to represent the full dataset.
+    data files, return the fitted objects, and then sum them together to represent the full dataset. Scaler
+    supports numpy arrays, pandas dataframes, and xarray DataArrays and will return a transformed array in the
+    same form as the original with column or coordinate names preserved.
 
     """
     def __init__(self):
         self.mean_x_ = None
         self.n_ = 0
         self.var_x_ = None
-        self.fit_ = False
-        self.x_columns_ = None
+        super().__init__()
 
-    def fit(self, x):
-        if hasattr(x, "columns"):
-            self.x_columns_ = x.columns
-            xv = x.values
-        else:
-            self.x_columns_ = np.arange(x.shape[-1])
-            xv = x
-        if not self.fit_:
+    def fit(self, x, weight=None):
+        xv = self.extract_x_columns(x)
+        if not self._fit:
             self.n_ += xv.shape[0]
             self.mean_x_ = np.zeros(xv.shape[-1], dtype=xv.dtype)
             self.var_x_ = np.zeros(xv.shape[-1], dtype=xv.dtype)
             for i in range(xv.shape[-1]):
-                self.mean_x_[i] = np.mean(xv[..., i])
-                self.var_x_[i] = np.var(xv[..., i], ddof=1)
+                self.mean_x_[i] = np.nanmean(xv[..., i])
+                self.var_x_[i] = np.nanvar(xv[..., i], ddof=1)
         else:
-            assert x.shape[-1] == self.mean_x_.shape[0], "New data has a different number of columns than current scaler"
+            assert x.shape[-1] == self.mean_x_.shape[0], "New data has a different number of columns"
             # update derived from https://math.stackexchange.com/questions/2971315/how-do-i-combine-standard-deviations-of-two-groups
             for i in range(x.shape[-1]):
-                new_mean = np.mean(xv[..., i])
-                new_var = np.var(xv[..., i], ddof=1)
+                new_mean = np.nanmean(xv[..., i])
+                new_var = np.nanvar(xv[..., i], ddof=1)
                 new_n = xv.shape[0]
                 combined_mean = (self.n_ * self.mean_x_[i] + x.shape[0] * new_mean) / (self.n_ + x.shape[0])
                 weighted_var = ((self.n_ - 1) * self.var_x_[i] + (new_n - 1) * new_var) / (self.n_ + new_n - 1)
@@ -45,18 +124,18 @@ class DStandardScaler(object):
                 self.mean_x_[i] = combined_mean
                 self.var_x_[i] = weighted_var + var_correction
                 self.n_ += new_n
-        self.fit_ = True
+        self._fit = True
 
     def transform(self, x):
-        assert self.fit_, "Scaler has not been fit."
+        assert self._fit, "Scaler has not been fit."
         assert x.shape[-1] == self.mean_x_.shape[0], "New data has a different number of columns than current scaler"
         x_mean, x_var = self.get_scales()
         x_transformed = (x - x_mean) / np.sqrt(x_var)
         return x_transformed
 
     def inverse_transform(self, x):
-        assert self.fit_, "Scaler has not been fit."
-        assert x.shape[1] == self.mean_x_.shape[0], "New data has a different number of columns than current scaler"
+        assert self._fit, "Scaler has not been fit."
+        assert x.shape[-1] == self.mean_x_.shape[0], "New data has a different number of columns than current scaler"
         x_mean, x_var = self.get_scales()
         x_transformed = x * np.sqrt(x_var) + x_mean
         return x_transformed
@@ -74,54 +153,52 @@ class DStandardScaler(object):
         current = copy(self)
         current.mean_x_ = (self.n_ * self.mean_x_ + other.n_ * other.mean_x_) / (self.n_ + other.n_)
         combined_var = ((self.n_ - 1) * self.var_x_ + (other.n_ - 1) * other.var_x_) / (self.n_ + other.n_ - 1)
-        combined_var_corr = self.n_ * other.n_ * (self.mean_x_ - other.mean_x_) ** 2 / ((self.n_ + other.n_) * (self.n_ + other.n_ - 1))
+        combined_var_corr = self.n_ * other.n_ * (self.mean_x_ - other.mean_x_) ** 2 / (
+                (self.n_ + other.n_) * (self.n_ + other.n_ - 1))
         current.var_x_ = combined_var + combined_var_corr
         current.n_ = self.n_ + other.n_
         return current
 
 
-class DMinMaxScaler(object):
+class DMinMaxScaler(DBaseScaler):
     """
     Distributed MinMaxScaler enables calculation of min and max of variables in datasets in parallel then combining
-    the mins and maxes as a reduction step.
+    the mins and maxes as a reduction step. Scaler
+    supports numpy arrays, pandas dataframes, and xarray DataArrays and will return a transformed array in the
+    same form as the original with column or coordinate names preserved.
 
     """
     def __init__(self):
         self.max_x_ = None
         self.min_x_ = None
-        self.fit_ = False
-        self.x_columns_ = None
+        super().__init__()
 
-    def fit(self, x):
-        if hasattr(x, "columns"):
-            self.x_columns_ = x.columns
-            xv = x.values
-        else:
-            self.x_columns_ = np.arange(x.shape[-1])
-            xv = x
-        if not self.fit_:
-            self.max_x_ = np.zeros(x.shape[-1])
-            self.min_x_ = np.zeros(x.shape[-1])
-            for i in range(x.shape[-1]):
-                self.max_x_[i] = np.max(xv[..., i])
-                self.min_x_[i] = np.min(xv[..., i])
+    def fit(self, x, weight=None):
+        xv = self.extract_x_columns(x)
+        if not self._fit:
+            self.max_x_ = np.zeros(xv.shape[-1])
+            self.min_x_ = np.zeros(xv.shape[-1])
+            for i in range(xv.shape[-1]):
+                self.max_x_[i] = np.nanmax(xv[..., i])
+                self.min_x_[i] = np.nanmin(xv[..., i])
 
         else:
             for i in range(x.shape[-1]):
-                self.max_x_[i] = np.maximum(self.max_x_[i], np.max(xv[..., i]))
-                self.min_x_[i] = np.minimum(self.min_x_[i], np.min(xv[..., i]))
-        self.fit_ = True
+                self.max_x_[i] = np.maximum(self.max_x_[i], np.nanmax(xv[..., i]))
+                self.min_x_[i] = np.minimum(self.min_x_[i], np.nanmin(xv[..., i]))
+        self._fit = True
 
     def transform(self, x):
-        assert self.fit_, "Scaler has not been fit."
+        assert self._fit, "Scaler has not been fit."
         assert x.shape[-1] == self.min_x_.shape[0], "New data has a different number of columns than current scaler"
         x_transformed = (x - self.min_x_) / (self.max_x_ - self.min_x_)
         return x_transformed
 
     def inverse_transform(self, x):
-        assert self.fit_, "Scaler has not been fit."
+        assert self._fit, "Scaler has not been fit."
         assert x.shape[-1] == self.min_x_.shape[0], "New data has a different number of columns than current scaler"
         x_transformed = x * (self.max_x_ - self.min_x_) + self.min_x_
+        x_transformed = self.package_transformed_x(x_transformed, x)
         return x_transformed
 
     def fit_transform(self, x):
@@ -140,49 +217,46 @@ class DMinMaxScaler(object):
         return current
 
 
-class DQuantileTransformer(object):
+class DQuantileTransformer(DBaseScaler):
     """
     Distributed quantile transformer that uses the T-Digest algorithm to transform the input data into approximate
     quantiles. This class stores the centroids and counts from the T-Digest algorithm and calls pytdigest to
     perform centroid fitting and transforms of data when needed. DQuantileTransformer objects can be added together
     to create a combined quantile distribution, enabling map-reduce-style distributed calculations of quantiles
     across large number of files. The same object can also be fit multiple times to compile quantiles serially
-    but with lower memory usage.
+    but with lower memory usage. Scaler supports numpy arrays, pandas dataframes, and xarray DataArrays and
+    will return a transformed array in the same form as the original with column or coordinate names preserved.
 
     Args:
         max_merged_centroids (int): Maximum number of centroids in TDigest
         distribution (str): Output distribution of transform. Options are "uniform" (default), "normal", and "logistic".
     """
-    def __init__(self, max_merged_centroids=1000, distribution="uniform", x_columns=None, centroids=None):
+    def __init__(self, max_merged_centroids=1000, distribution="uniform"):
         self.max_merged_centroids = max_merged_centroids
         self.distribution = distribution
-        self._fit = False
-        self.x_columns = x_columns
-        self.centroids = centroids
+        self.centroids_ = None
+        super().__init__()
         return
 
     def fit(self, x, weight=None):
-        if hasattr(x, "columns"):
-            self.x_columns = x.columns
-        else:
-            self.x_columns = np.arange(x.shape[-1])
+        xv = self.extract_x_columns(x)
         if not self._fit:
             # The number of centroids may vary depending on the distribution of each input variable.
             # The extra spots at the end are padded with nans.
-            self.centroids = np.ones((x.shape[-1], self.max_merged_centroids, 2)) * np.nan
-            for i in range(x.shape[-1]):
-                td_obj = TDigest.compute(x[..., i].ravel(), w=weight, compression=self.max_merged_centroids)
+            self.centroids_ = np.ones((xv.shape[-1], self.max_merged_centroids, 2)) * np.nan
+            for i in range(xv.shape[-1]):
+                td_obj = TDigest.compute(xv[..., i].ravel(), w=weight, compression=self.max_merged_centroids)
                 td_obj.force_merge()
-                self.centroids[i, :td_obj._num_merged] = td_obj.get_centroids()
+                self.centroids_[i, :td_obj._num_merged] = td_obj.get_centroids()
         else:
             td_objs = self.to_digests()
-            new_centroids = np.ones((x.shape[-1], self.max_merged_centroids, 2)) * np.nan
+            new_centroids = np.ones((xv.shape[-1], self.max_merged_centroids, 2)) * np.nan
             for i, td_obj in enumerate(td_objs):
-                new_td_obj = TDigest.compute(x[..., i].ravel(), w=weight, compression=self.max_merged_centroids)
+                new_td_obj = TDigest.compute(xv[..., i].ravel(), w=weight, compression=self.max_merged_centroids)
                 combined_td_obj = td_obj + new_td_obj
                 combined_td_obj.force_merge()
                 new_centroids[i, :combined_td_obj._num_merged] = combined_td_obj.get_centroids()
-            self.centroids = new_centroids
+            self.centroids_ = new_centroids
         self._fit = True
         return
 
@@ -195,9 +269,9 @@ class DQuantileTransformer(object):
         """
         assert self._fit, "Must call fit() before calling to_digests()"
         td_objs = []
-        for i in range(self.centroids.shape[0]):
-            centroid_len = np.where(np.isnan(self.centroids[i, :, 0]))[0].min()
-            td_objs.append(TDigest.of_centroids(self.centroids[i, :centroid_len],
+        for i in range(self.centroids_.shape[0]):
+            centroid_len = np.where(np.isnan(self.centroids_[i, :, 0]))[0].min()
+            td_objs.append(TDigest.of_centroids(self.centroids_[i, :centroid_len],
                                                 compression=self.max_merged_centroids))
         return td_objs
 
@@ -209,15 +283,17 @@ class DQuantileTransformer(object):
 
     def transform(self, x):
         assert self._fit, "Scaler has not been fit."
-        assert x.shape[-1] == len(self.x_columns), "New data has a different number of columns than current scaler"
+        assert x.shape[-1] == len(self.x_columns_), "New data has a different number of columns than current scaler"
         td_objs = self.to_digests()
-        x_transformed = np.zeros(x.shape, dtype=x.dtype)
+        xv = self.extract_array(x)
+        x_transformed = np.zeros(x.shape, dtype=xv.dtype)
         for i in range(x.shape[-1]):
-            x_transformed[..., i] = np.reshape(td_objs[i].cdf(x[..., i].ravel()), x[..., i].shape)
+            x_transformed[..., i] = np.reshape(td_objs[i].cdf(xv[..., i].ravel()), xv[..., i].shape)
         if self.distribution == "normal":
             x_transformed = norm.ppf(x_transformed)
         elif self.distribution == "logistic":
             x_transformed = logistic.ppf(x_transformed)
+        x_transformed = self.package_transformed_x(x_transformed, x)
         return x_transformed
 
     def fit_transform(self, x, weight=None):
@@ -226,31 +302,32 @@ class DQuantileTransformer(object):
 
     def inverse_transform(self, x):
         assert self._fit, "Scaler has not been fit."
-        assert x.shape[-1] == len(self.x_columns), "New data has a different number of columns than current scaler"
-        x_transformed = np.zeros(x.shape, dtype=x.dtype)
+        assert x.shape[-1] == len(self.x_columns_), "New data has a different number of columns than current scaler"
+        xv = self.extract_array(x)
+        x_transformed = np.zeros(x.shape, dtype=xv.dtype)
         td_objs = self.to_digests()
         for i in range(x.shape[-1]):
-            x_transformed[..., i] = np.reshape(td_objs[i].inverse_cdf(x[..., i].ravel()), x[..., i].shape)
+            x_transformed[..., i] = np.reshape(td_objs[i].inverse_cdf(xv[..., i].ravel()), xv[..., i].shape)
         if self.distribution == "normal":
             x_transformed = norm.cdf(x_transformed)
         elif self.distribution == "logistic":
             x_transformed = logistic.cdf(x_transformed)
+        x_transformed = self.package_transformed_x(x_transformed, x)
         return x_transformed
 
     def __add__(self, other):
         assert type(other) is DQuantileTransformer, "Adding mismatched scaler types."
+        assert self.is_fit() and other.is_fit(), "At least one scaler is not fit."
         td_objs = self.to_digests()
         other_td_objs = other.to_digests()
         assert len(td_objs) == len(other_td_objs), "Number of variables in scalers do not match."
-        combined_centroids = np.ones(self.centroids.shape) * np.nan
+        combined_centroids = np.ones(self.centroids_.shape) * np.nan
         for i in range(len(td_objs)):
             combined_td_obj = td_objs[i] + other_td_objs[i]
             combined_td_obj.force_merge()
             combined_centroids[i, :combined_td_obj._num_merged] = combined_td_obj.get_centroids()
-        new_dquantile = DQuantileTransformer(max_merged_centroids=self.max_merged_centroids,
-                                             x_columns=self.x_columns,
-                                             centroids=combined_centroids)
-        new_dquantile._fit = True
+        new_dquantile = copy(self)
+        new_dquantile.centroids_ = combined_centroids
         return new_dquantile
 
 
