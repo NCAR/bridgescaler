@@ -10,6 +10,7 @@ dependencies:
   - pyarrow
   - pytest
   - sphinx
+  - xarray
   - pip:
     - pytdigest
     - sphinx-book-theme
