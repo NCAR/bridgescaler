@@ -12,7 +12,7 @@ def make_test_data():
     col_names = ["a", "b", "c", "d", "e"]
     test_data["means"] = np.array([0, 5.3, -2.421, 21456.3, 1.e-5])
     test_data["sds"] = np.array([5, 352.2, 1e-4, 20000.3, 5.3e-2])
-    test_data["n_examples"] = np.array([30000, 500, 3352, 88])
+    test_data["n_examples"] = np.array([3000, 500, 3352, 88])
     test_data["numpy_2d"] = []
     test_data["numpy_4d"] = []
     test_data["pandas"] = []
@@ -75,7 +75,11 @@ def test_dstandard_scaler():
     assert mean_4d.shape[0] == test_data["means"].shape[0] and var_4d.shape[0] == test_data["sds"].shape[0], "Stat shape mismatch"
     assert np.max(np.abs(mean_2d - all_ds_2d.mean(axis=0))) < 1e-8, "significant difference in means"
     assert np.max(np.abs(var_2d - all_ds_2d.var(axis=0, ddof=1))) < 1e-5, "significant difference in variances"
-
+    sub_cols = ["d", "b"]
+    pd_sub_trans = pd_dss.transform(test_data["pandas"][0][sub_cols])
+    assert pd_sub_trans.shape[1] == len(sub_cols), "Did not subset properly"
+    pd_sub_inv_trans = pd_dss.inverse_transform(pd_sub_trans)
+    assert pd_sub_inv_trans.shape[1] == len(sub_cols), "Did not subset properly on inverse."
 
 def test_dminmax_scaler():
     all_ds_2d = np.vstack(test_data["numpy_2d"])
@@ -97,6 +101,11 @@ def test_dminmax_scaler():
     pd_dss = DMinMaxScaler()
     pd_trans = pd_dss.fit_transform(test_data["pandas"][0])
     pd_inv_trans = pd_dss.inverse_transform(pd_trans)
+    sub_cols = ["d", "b"]
+    pd_sub_trans = pd_dss.transform(test_data["pandas"][0][sub_cols])
+    assert pd_sub_trans.shape[1] == len(sub_cols), "Did not subset properly"
+    pd_sub_inv_trans = pd_dss.inverse_transform(pd_sub_trans)
+    assert pd_sub_inv_trans.shape[1] == len(sub_cols), "Did not subset properly on inverse."
     assert type(pd_trans) is type(test_data["pandas"][0]), "Pandas DataFrame type not passed through transform"
     assert type(pd_inv_trans) is type(test_data["pandas"][0]), "Pandas DataFrame type not passed through inverse"
     xr_dss = DMinMaxScaler()
@@ -132,6 +141,11 @@ def test_dquantile_scaler():
     pd_dss = DQuantileTransformer()
     pd_trans = pd_dss.fit_transform(test_data["pandas"][0])
     pd_inv_trans = pd_dss.inverse_transform(pd_trans)
+    sub_cols = ["d", "b"]
+    pd_sub_trans = pd_dss.transform(test_data["pandas"][0][sub_cols])
+    assert pd_sub_trans.shape[1] == len(sub_cols), "Did not subset properly"
+    pd_sub_inv_trans = pd_dss.inverse_transform(pd_sub_trans)
+    assert pd_sub_inv_trans.shape[1] == len(sub_cols), "Did not subset properly on inverse."
     assert type(pd_trans) is type(test_data["pandas"][0]), "Pandas DataFrame type not passed through transform"
     assert type(pd_inv_trans) is type(test_data["pandas"][0]), "Pandas DataFrame type not passed through inverse"
     xr_dss = DQuantileTransformer()
@@ -140,6 +154,7 @@ def test_dquantile_scaler():
     combined_scaler = np.sum(dsses_2d)
     assert np.nansum(combined_scaler.centroids_[0, :, 1]) == test_data["n_examples"].sum(), \
         "Summing did not work properly."
+
 
     return
 

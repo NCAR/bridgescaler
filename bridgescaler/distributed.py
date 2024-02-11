@@ -1,8 +1,10 @@
 import numpy as np
-from copy import copy
+from copy import copy, deepcopy
+
 from pytdigest import TDigest
 from scipy.stats import norm, logistic
-
+from xarray import DataArray
+from pandas import DataFrame
 
 class DBaseScaler(object):
     """
@@ -11,12 +13,14 @@ class DBaseScaler(object):
     """
     def __init__(self):
         self.x_columns_ = None
+        self.is_array_ = False
         self._fit = False
 
     def is_fit(self):
         return self._fit
 
-    def extract_x_columns(self, x):
+    @staticmethod
+    def extract_x_columns(x):
         """
         Extract the variable names to be transformed from x depending on if x is a pandas DataFrame, an
         xarray DataArray, or a numpy array. All of these assume that the columns are in the last dimension.
@@ -28,25 +32,42 @@ class DBaseScaler(object):
 
         Returns:
             xv (numpy.ndarray): Array of values to be transformed.
+            is_array (bool): Whether or not x was a np.ndarray.
         """
+        is_array = False
         if hasattr(x, "columns"):
-            self.x_columns_ = x.columns
-            xv = x.values
+            x_columns = x.columns
         elif hasattr(x, "coords"):
             var_dim = x.dims[-1]
-            self.x_columns_ = x.coords[var_dim].values
-            xv = x.values
+            x_columns = x.coords[var_dim].values
         else:
-            self.x_columns_ = np.arange(x.shape[-1])
-            xv = x
-        return xv
+            x_columns = np.arange(x.shape[-1])
+            is_array = True
+        return x_columns, is_array
 
-    def extract_array(self, x):
+    @staticmethod
+    def extract_array(x):
         if hasattr(x, "columns") or hasattr(x, "coords"):
             xv = x.values
         else:
             xv = x
         return xv
+
+    def get_column_order(self, x_in_columns):
+        """
+        Get the indices of the scaler columns that have the same name as the columns in the input x array. This
+        enables users to pass a DataFrame or DataArray to transform or inverse_transform with fewer columns than
+        the original scaler or columns in a different order and still have the input dataset be transformed properly.
+
+        Args:
+            x_in_columns (Union[list, numpy.ndarray]): list of input columns.
+
+        Returns:
+            x_in_col_indices (np.ndarray): indices of the input columns from x in the scaler in order.
+        """
+        assert np.all(np.isin(x_in_columns, self.x_columns_)), "Some input columns not in scaler x_columns."
+        x_in_col_indices = np.array([np.where(col == np.array(self.x_columns_))[0][0] for col in x_in_columns])
+        return x_in_col_indices
     
     @staticmethod
     def package_transformed_x(x_transformed, x):
@@ -62,10 +83,10 @@ class DBaseScaler(object):
 
         """
         if hasattr(x, "columns"):
-            x_packaged = copy(x)
+            x_packaged = deepcopy(x)
             x_packaged.loc[:, :] = x_transformed
         elif hasattr(x, "coords"):
-            x_packaged = copy(x)
+            x_packaged = deepcopy(x)
             x_packaged[:] = x_transformed
         else:
             x_packaged = x_transformed
@@ -86,6 +107,12 @@ class DBaseScaler(object):
     def __add__(self, other):
         pass
 
+    def subset_columns(self, sel_columns):
+        pass
+
+    def add_variables(self, other):
+        pass
+
 
 class DStandardScaler(DBaseScaler):
     """
@@ -102,7 +129,8 @@ class DStandardScaler(DBaseScaler):
         super().__init__()
 
     def fit(self, x, weight=None):
-        xv = self.extract_x_columns(x)
+        self.x_columns_, self.is_array_ = self.extract_x_columns(x)
+        xv = self.extract_array(x)
         if not self._fit:
             self.n_ += xv.shape[0]
             self.mean_x_ = np.zeros(xv.shape[-1], dtype=xv.dtype)
@@ -128,16 +156,28 @@ class DStandardScaler(DBaseScaler):
 
     def transform(self, x):
         assert self._fit, "Scaler has not been fit."
-        assert x.shape[-1] == self.mean_x_.shape[0], "New data has a different number of columns than current scaler"
+        x_in_cols, is_array = self.extract_x_columns(x)
+        if is_array:
+            assert x.shape[-1] == self.mean_x_.shape[0], "Number of input columns does not match scaler."
+            x_col_order = np.arange(x.shape[-1])
+        else:
+            x_col_order = self.get_column_order(x_in_cols)
         x_mean, x_var = self.get_scales()
-        x_transformed = (x - x_mean) / np.sqrt(x_var)
+        x_transformed = (x - x_mean[x_col_order]) / np.sqrt(x_var[x_col_order])
+        x_transformed = self.package_transformed_x(x_transformed, x)
         return x_transformed
 
     def inverse_transform(self, x):
         assert self._fit, "Scaler has not been fit."
-        assert x.shape[-1] == self.mean_x_.shape[0], "New data has a different number of columns than current scaler"
+        x_in_cols, is_array = self.extract_x_columns(x)
+        if is_array or self.is_array_:
+            assert x.shape[-1] == self.mean_x_.shape[0], "Number of input columns does not match scaler."
+            x_col_order = np.arange(x.shape[-1])
+        else:
+            x_col_order = self.get_column_order(x_in_cols)
         x_mean, x_var = self.get_scales()
-        x_transformed = x * np.sqrt(x_var) + x_mean
+        x_transformed = x * np.sqrt(x_var[x_col_order]) + x_mean[x_col_order]
+        x_transformed = self.package_transformed_x(x_transformed, x)
         return x_transformed
 
     def fit_transform(self, x):
@@ -150,7 +190,7 @@ class DStandardScaler(DBaseScaler):
     def __add__(self, other):
         assert type(other) is DStandardScaler, "Input is not DStandardScaler"
         assert np.all(other.x_columns_ == self.x_columns_), "Scaler columns do not match."
-        current = copy(self)
+        current = deepcopy(self)
         current.mean_x_ = (self.n_ * self.mean_x_ + other.n_ * other.mean_x_) / (self.n_ + other.n_)
         combined_var = ((self.n_ - 1) * self.var_x_ + (other.n_ - 1) * other.var_x_) / (self.n_ + other.n_ - 1)
         combined_var_corr = self.n_ * other.n_ * (self.mean_x_ - other.mean_x_) ** 2 / (
@@ -174,7 +214,8 @@ class DMinMaxScaler(DBaseScaler):
         super().__init__()
 
     def fit(self, x, weight=None):
-        xv = self.extract_x_columns(x)
+        self.x_columns_, self.is_array_ = self.extract_x_columns(x)
+        xv = self.extract_array(x)
         if not self._fit:
             self.max_x_ = np.zeros(xv.shape[-1])
             self.min_x_ = np.zeros(xv.shape[-1])
@@ -190,14 +231,25 @@ class DMinMaxScaler(DBaseScaler):
 
     def transform(self, x):
         assert self._fit, "Scaler has not been fit."
-        assert x.shape[-1] == self.min_x_.shape[0], "New data has a different number of columns than current scaler"
-        x_transformed = (x - self.min_x_) / (self.max_x_ - self.min_x_)
+        x_in_cols, is_array = self.extract_x_columns(x)
+        if is_array:
+            assert x.shape[-1] == self.max_x_.shape[0], "Number of input columns does not match scaler."
+            x_col_order = np.arange(x.shape[-1])
+        else:
+            x_col_order = self.get_column_order(x_in_cols)
+        x_transformed = (x - self.min_x_[x_col_order]) / (self.max_x_[x_col_order] - self.min_x_[x_col_order])
+        x_transformed = self.package_transformed_x(x_transformed, x)
         return x_transformed
 
     def inverse_transform(self, x):
         assert self._fit, "Scaler has not been fit."
-        assert x.shape[-1] == self.min_x_.shape[0], "New data has a different number of columns than current scaler"
-        x_transformed = x * (self.max_x_ - self.min_x_) + self.min_x_
+        x_in_cols, is_array = self.extract_x_columns(x)
+        if is_array:
+            assert x.shape[-1] == self.max_x_.shape[0], "Number of input columns does not match scaler."
+            x_col_order = np.arange(x.shape[-1])
+        else:
+            x_col_order = self.get_column_order(x_in_cols)
+        x_transformed = x * (self.max_x_[x_col_order] - self.min_x_[x_col_order]) + self.min_x_[x_col_order]
         x_transformed = self.package_transformed_x(x_transformed, x)
         return x_transformed
 
@@ -211,7 +263,7 @@ class DMinMaxScaler(DBaseScaler):
     def __add__(self, other):
         assert type(other) is DMinMaxScaler, "Input is not DMinMaxScaler"
         assert np.all(other.x_columns_ == self.x_columns_), "Scaler columns do not match."
-        current = copy(self)
+        current = deepcopy(self)
         current.max_x_ = np.maximum(self.max_x_, other.max_x_)
         current.min_x_ = np.minimum(self.min_x_, other.min_x_)
         return current
@@ -239,7 +291,8 @@ class DQuantileTransformer(DBaseScaler):
         return
 
     def fit(self, x, weight=None):
-        xv = self.extract_x_columns(x)
+        self.x_columns_, self.is_array_ = self.extract_x_columns(x)
+        xv = self.extract_array(x)
         if not self._fit:
             # The number of centroids may vary depending on the distribution of each input variable.
             # The extra spots at the end are padded with nans.
@@ -283,12 +336,17 @@ class DQuantileTransformer(DBaseScaler):
 
     def transform(self, x):
         assert self._fit, "Scaler has not been fit."
-        assert x.shape[-1] == len(self.x_columns_), "New data has a different number of columns than current scaler"
+        x_in_cols, is_array = self.extract_x_columns(x)
+        if is_array:
+            assert x.shape[-1] == self.centroids_.shape[0], "Number of input columns does not match scaler."
+            x_col_order = np.arange(x.shape[-1])
+        else:
+            x_col_order = self.get_column_order(x_in_cols)
         td_objs = self.to_digests()
         xv = self.extract_array(x)
-        x_transformed = np.zeros(x.shape, dtype=xv.dtype)
-        for i in range(x.shape[-1]):
-            x_transformed[..., i] = np.reshape(td_objs[i].cdf(xv[..., i].ravel()), xv[..., i].shape)
+        x_transformed = np.zeros(xv.shape, dtype=xv.dtype)
+        for i, o in enumerate(x_col_order):
+            x_transformed[..., i] = np.reshape(td_objs[o].cdf(xv[..., i].ravel()), xv[..., i].shape)
         if self.distribution == "normal":
             x_transformed = norm.ppf(x_transformed)
         elif self.distribution == "logistic":
@@ -302,12 +360,17 @@ class DQuantileTransformer(DBaseScaler):
 
     def inverse_transform(self, x):
         assert self._fit, "Scaler has not been fit."
-        assert x.shape[-1] == len(self.x_columns_), "New data has a different number of columns than current scaler"
+        x_in_cols, is_array = self.extract_x_columns(x)
+        if is_array:
+            assert x.shape[-1] == self.centroids_.shape[0], "Number of input columns does not match scaler."
+            x_col_order = np.arange(x.shape[-1])
+        else:
+            x_col_order = self.get_column_order(x_in_cols)
         xv = self.extract_array(x)
         x_transformed = np.zeros(x.shape, dtype=xv.dtype)
         td_objs = self.to_digests()
-        for i in range(x.shape[-1]):
-            x_transformed[..., i] = np.reshape(td_objs[i].inverse_cdf(xv[..., i].ravel()), xv[..., i].shape)
+        for i, o in enumerate(x_col_order):
+            x_transformed[..., i] = np.reshape(td_objs[o].inverse_cdf(xv[..., i].ravel()), xv[..., i].shape)
         if self.distribution == "normal":
             x_transformed = norm.cdf(x_transformed)
         elif self.distribution == "logistic":
@@ -321,24 +384,13 @@ class DQuantileTransformer(DBaseScaler):
         td_objs = self.to_digests()
         other_td_objs = other.to_digests()
         assert len(td_objs) == len(other_td_objs), "Number of variables in scalers do not match."
-        combined_centroids = np.ones(self.centroids_.shape) * np.nan
+        max_centroids = np.maximum(self.max_merged_centroids, other.max_merged_centroids)
+        combined_centroids = np.ones((self.centroids_.shape[0], max_centroids, self.centroids_.shape[2])) * np.nan
         for i in range(len(td_objs)):
             combined_td_obj = td_objs[i] + other_td_objs[i]
             combined_td_obj.force_merge()
             combined_centroids[i, :combined_td_obj._num_merged] = combined_td_obj.get_centroids()
-        new_dquantile = copy(self)
+        new_dquantile = deepcopy(self)
+        new_dquantile.max_merged_centroids = max_centroids
         new_dquantile.centroids_ = combined_centroids
         return new_dquantile
-
-
-
-
-
-
-
-
-
-
-
-
-    
