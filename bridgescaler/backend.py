@@ -29,8 +29,9 @@ def save_scaler(scaler, scaler_file):
     """
     Save a scikit-learn or bridgescaler scaler object to json format.
 
-    :param scaler: scikit-learn-style scaler object
-    :param scaler_file: path to json file where scaler information is stored.
+    Args:
+        scaler: scikit-learn-style scaler object
+        scaler_file: path to json file where scaler information is stored.
     """
     scaler_params = scaler.__dict__
     scaler_params["type"] = str(type(scaler))[1:-2].split(".")[-1]
@@ -39,23 +40,55 @@ def save_scaler(scaler, scaler_file):
     return
 
 
-def load_scaler(scaler_file):
+def print_scaler(scaler):
     """
-    Initialize scikit-learn or bridgescaler scaler from saved json file.
+    Output scikit-learn or bridgescaler scaler object to json string.
 
-    :param scaler_file: path to json file.
-    :return: scaler object.
+    Args:
+        scaler: scikit-learn-style scaler object
+
+    Returns:
+        str representation of object in json format
     """
-    with open(scaler_file, "r") as file_obj:
-        scaler_params = json.load(file_obj)
+    scaler_params = scaler.__dict__
+    scaler_params["type"] = str(type(scaler))[1:-2].split(".")[-1]
+    return json.dumps(scaler_params, indent=4, sort_keys=True, cls=NumpyEncoder)
+
+
+def read_scaler(scaler_str):
+    """
+    Initialize scikit-learn or bridgescaler scaler from json str.
+
+    Args:
+        scaler_str: json str
+
+    Returns:
+        scaler object.
+    """
+    scaler_params = json.loads(scaler_str)
     scaler = scaler_objs[scaler_params["type"]]()
     del scaler_params["type"]
     for k, v in scaler_params.items():
-        if type(v) == dict:
+        if type(v) is dict:
             setattr(scaler, k, np.array(v['data'], dtype=v['dtype']).reshape(v['shape']))
         else:
             setattr(scaler, k, v)
     return scaler
+
+
+def load_scaler(scaler_file):
+    """
+    Initialize scikit-learn or bridgescaler scaler from saved json file.
+
+    Args:
+        scaler_file: path to json file.
+
+    Returns:
+        scaler object.
+    """
+    with open(scaler_file, "r") as file_obj:
+        scaler_str = file_obj.read()
+    return read_scaler(scaler_str)
 
 
 class NumpyEncoder(json.JSONEncoder):
