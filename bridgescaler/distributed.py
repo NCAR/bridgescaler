@@ -1,10 +1,9 @@
 import numpy as np
-from copy import copy, deepcopy
-
+from copy import deepcopy
 from pytdigest import TDigest
 from scipy.stats import norm, logistic
-from xarray import DataArray
-from pandas import DataFrame
+
+
 
 class DBaseScaler(object):
     """
@@ -36,7 +35,7 @@ class DBaseScaler(object):
         """
         is_array = False
         if hasattr(x, "columns"):
-            x_columns = x.columns
+            x_columns = x.columns.values
         elif hasattr(x, "coords"):
             var_dim = x.dims[-1]
             x_columns = x.coords[var_dim].values
@@ -367,14 +366,14 @@ class DQuantileTransformer(DBaseScaler):
         else:
             x_col_order = self.get_column_order(x_in_cols)
         xv = self.extract_array(x)
-        x_transformed = np.zeros(x.shape, dtype=xv.dtype)
+        x_transformed = np.zeros(xv.shape, dtype=xv.dtype)
         td_objs = self.to_digests()
-        for i, o in enumerate(x_col_order):
-            x_transformed[..., i] = np.reshape(td_objs[o].inverse_cdf(xv[..., i].ravel()), xv[..., i].shape)
         if self.distribution == "normal":
-            x_transformed = norm.cdf(x_transformed)
+            x_transformed = norm.cdf(xv)
         elif self.distribution == "logistic":
-            x_transformed = logistic.cdf(x_transformed)
+            x_transformed = logistic.cdf(xv)
+        for i, o in enumerate(x_col_order):
+            x_transformed[..., i] = np.reshape(td_objs[o].inverse_cdf(x_transformed[..., i].ravel()), xv[..., i].shape)
         x_transformed = self.package_transformed_x(x_transformed, x)
         return x_transformed
 
