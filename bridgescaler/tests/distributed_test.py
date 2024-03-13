@@ -160,7 +160,10 @@ def test_dquantile_scaler():
     combined_scaler = np.sum(dsses_2d)
     assert np.nansum(combined_scaler.centroids_[0, :, 1]) == test_data["n_examples"].sum(), \
         "Summing did not work properly."
-
+    test_data_c_first = test_data["xarray"][0].transpose("batch", "variable", "y", "x")
+    xr_dss_first = xr_dss.transform(test_data_c_first, channels_last=False)
+    xr_inv_dss_first = xr_dss.inverse_transform(xr_dss_first, channels_last=False)
+    assert xr_dss_first.shape == xr_inv_dss_first.shape, "shape does not match"
 
     return
 
