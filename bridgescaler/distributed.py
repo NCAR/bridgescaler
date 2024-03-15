@@ -158,10 +158,12 @@ class DStandardScaler(DBaseScaler):
         super().__init__(channels_last=channels_last)
 
     def fit(self, x, weight=None):
-        self.x_columns_, self.is_array_ = self.extract_x_columns(x)
+        x_columns, is_array = self.extract_x_columns(x, channels_last=self.channels_last)
         xv = self.extract_array(x)
         channel_dim = self.set_channel_dim()
         if not self._fit:
+            self.x_columns_ = x_columns
+            self.is_array_ = is_array
             self.n_ += xv.shape[0]
             self.mean_x_ = np.zeros(xv.shape[channel_dim], dtype=xv.dtype)
             self.var_x_ = np.zeros(xv.shape[channel_dim], dtype=xv.dtype)
@@ -176,14 +178,13 @@ class DStandardScaler(DBaseScaler):
 
         else:
             assert x.shape[channel_dim] == self.x_columns_.shape[0], "New data has a different number of columns"
-            x_in_cols, is_array = self.extract_x_columns(x, channels_last=self.channels_last)
             if is_array:
                 x_col_order = np.arange(x.shape[-1])
             else:
-                x_col_order = self.get_column_order(x_in_cols)
+                x_col_order = self.get_column_order(x_columns)
             # update derived from
             # https://math.stackexchange.com/questions/2971315/how-do-i-combine-standard-deviations-of-two-groups
-            for i in x_col_order:
+            for i, o in enumerate(x_col_order):
                 if self.channels_last:
                     new_mean = np.nanmean(xv[..., i])
                     new_var = np.nanvar(xv[..., i], ddof=1)
@@ -191,12 +192,12 @@ class DStandardScaler(DBaseScaler):
                     new_mean = np.nanmean(xv[:, i])
                     new_var = np.nanvar(xv[:, i], ddof=1)
                 new_n = xv.shape[0]
-                combined_mean = (self.n_ * self.mean_x_[i] + x.shape[0] * new_mean) / (self.n_ + x.shape[0])
-                weighted_var = ((self.n_ - 1) * self.var_x_[i] + (new_n - 1) * new_var) / (self.n_ + new_n - 1)
-                var_correction = self.n_ * new_n * (self.mean_x_[i] - new_mean) ** 2 / (
+                combined_mean = (self.n_ * self.mean_x_[o] + x.shape[0] * new_mean) / (self.n_ + x.shape[0])
+                weighted_var = ((self.n_ - 1) * self.var_x_[o] + (new_n - 1) * new_var) / (self.n_ + new_n - 1)
+                var_correction = self.n_ * new_n * (self.mean_x_[o] - new_mean) ** 2 / (
                         (self.n_ + new_n) * (self.n_ + new_n - 1))
-                self.mean_x_[i] = combined_mean
-                self.var_x_[i] = weighted_var + var_correction
+                self.mean_x_[o] = combined_mean
+                self.var_x_[o] = weighted_var + var_correction
                 self.n_ += new_n
         self._fit = True
 
@@ -216,11 +217,11 @@ class DStandardScaler(DBaseScaler):
         xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
         x_mean, x_var = self.get_scales()
         if channels_last:
-            for i in x_col_order:
-                x_transformed[..., i] = (xv[..., i] - x_mean[i]) / np.sqrt(x_var[i])
+            for i, o in enumerate(x_col_order):
+                x_transformed[..., i] = (xv[..., i] - x_mean[o]) / np.sqrt(x_var[o])
         else:
-            for i in x_col_order:
-                x_transformed[:, i] = (xv[:, i] - x_mean[i]) / np.sqrt(x_var[i])
+            for i, o in enumerate(x_col_order):
+                x_transformed[:, i] = (xv[:, i] - x_mean[o]) / np.sqrt(x_var[o])
         x_transformed_final = self.package_transformed_x(x_transformed, x)
         return x_transformed_final
 
@@ -228,14 +229,13 @@ class DStandardScaler(DBaseScaler):
         xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
         x_mean, x_var = self.get_scales()
         if channels_last:
-            for i in x_col_order:
-                x_transformed[..., i] = xv[..., i] * np.sqrt(x_var[x_col_order]) + x_mean[x_col_order]
+            for i, o in enumerate(x_col_order):
+                x_transformed[..., i] = xv[..., i] * np.sqrt(x_var[o]) + x_mean[o]
         else:
-            for i in x_col_order:
-                x_transformed[:, i] = xv[:, i] * np.sqrt(x_var[x_col_order]) + x_mean[x_col_order]
+            for i, o in enumerate(x_col_order):
+                x_transformed[:, i] = xv[:, i] * np.sqrt(x_var[o]) + x_mean[o]
         x_transformed = self.package_transformed_x(x_transformed, x)
         return x_transformed
-
 
     def get_scales(self):
         return self.mean_x_, self.var_x_
@@ -267,12 +267,14 @@ class DMinMaxScaler(DBaseScaler):
         super().__init__(channels_last=channels_last)
 
     def fit(self, x, weight=None):
-        channel_dim = self.set_channel_dim()
-        self.x_columns_, self.is_array_ = self.extract_x_columns(x)
+        x_columns, is_array = self.extract_x_columns(x, channels_last=self.channels_last)
         xv = self.extract_array(x)
+        channel_dim = self.set_channel_dim()
         if not self._fit:
-            self.max_x_ = np.zeros(xv.shape[-1])
-            self.min_x_ = np.zeros(xv.shape[-1])
+            self.x_columns_ = x_columns
+            self.is_array_ = is_array
+            self.max_x_ = np.zeros(xv.shape[channel_dim])
+            self.min_x_ = np.zeros(xv.shape[channel_dim])
             if self.channels_last:
                 for i in range(xv.shape[channel_dim]):
                     self.max_x_[i] = np.nanmax(xv[..., i])
@@ -282,39 +284,44 @@ class DMinMaxScaler(DBaseScaler):
                     self.max_x_[i] = np.nanmax(xv[:, i])
                     self.min_x_[i] = np.nanmin(xv[:, i])
         else:
-            if self.channels_last:
-                for i in range(x.shape[channel_dim]):
-                    self.max_x_[i] = np.maximum(self.max_x_[i], np.nanmax(xv[..., i]))
-                    self.min_x_[i] = np.minimum(self.min_x_[i], np.nanmin(xv[..., i]))
+            assert x.shape[channel_dim] == self.x_columns_.shape[0], "New data has a different number of columns"
+            if is_array:
+                x_col_order = np.arange(x.shape[-1])
             else:
-                for i in range(xv.shape[channel_dim]):
-                    self.max_x_[i] = np.maximum(self.max_x_[i], np.nanmax(xv[:, i]))
-                    self.min_x_[i] = np.minimum(self.min_x_[i], np.nanmin(xv[:, i]))
+                x_col_order = self.get_column_order(x_columns)
+            if self.channels_last:
+                for i, o in enumerate(x_col_order):
+                    self.max_x_[o] = np.maximum(self.max_x_[o], np.nanmax(xv[..., i]))
+                    self.min_x_[o] = np.minimum(self.min_x_[o], np.nanmin(xv[..., i]))
+            else:
+                for i, o in enumerate(xv.shape[channel_dim]):
+                    self.max_x_[o] = np.maximum(self.max_x_[o], np.nanmax(xv[:, i]))
+                    self.min_x_[o] = np.minimum(self.min_x_[o], np.nanmin(xv[:, i]))
         self._fit = True
 
     def transform(self, x, channels_last=None):
         xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
         if channels_last:
-            for i in x_col_order:
-                x_transformed[..., i] = (xv[..., i] - self.min_x_[x_col_order]) / (
-                        self.max_x_[x_col_order] - self.min_x_[x_col_order])
+            for i, o in enumerate(x_col_order):
+                x_transformed[..., i] = (xv[..., i] - self.min_x_[o]) / (
+                        self.max_x_[o] - self.min_x_[o])
         else:
-            for i in x_col_order:
-                x_transformed[:, i] = (xv[:, i] - self.min_x_[x_col_order]) / (
-                        self.max_x_[x_col_order] - self.min_x_[x_col_order])
+            for i, o in enumerate(x_col_order):
+                x_transformed[:, i] = (xv[:, i] - self.min_x_[o]) / (
+                        self.max_x_[o] - self.min_x_[o])
         x_transformed = self.package_transformed_x(x_transformed, x)
         return x_transformed
 
     def inverse_transform(self, x, channels_last=None):
         xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
         if channels_last:
-            for i in x_col_order:
-                x_transformed[..., i] = xv[..., i] * (self.max_x_[x_col_order] -
-                                                      self.min_x_[x_col_order]) + self.min_x_[x_col_order]
+            for i, o in enumerate(x_col_order):
+                x_transformed[..., i] = xv[..., i] * (self.max_x_[o] -
+                                                      self.min_x_[o]) + self.min_x_[o]
         else:
-            for i in x_col_order:
-                x_transformed[:, i] = xv[:, i] * (self.max_x_[x_col_order] -
-                                                  self.min_x_[x_col_order]) + self.min_x_[x_col_order]
+            for i, o in enumerate(x_col_order):
+                x_transformed[:, i] = xv[:, i] * (self.max_x_[o] -
+                                                  self.min_x_[o]) + self.min_x_[o]
         x_transformed = self.package_transformed_x(x_transformed, x)
         return x_transformed
 
@@ -343,16 +350,18 @@ class DQuantileTransformer(DBaseScaler):
     Args:
         max_merged_centroids (int): Maximum number of centroids in TDigest
         distribution (str): Output distribution of transform. Options are "uniform" (default), "normal", and "logistic".
+        channels_last (bool): Whether data will use the last dimension (True) as the channels or variable dim
+            or the second dimension (False).
     """
-    def __init__(self, max_merged_centroids=1000, distribution="uniform"):
+    def __init__(self, max_merged_centroids=1000, distribution="uniform", channels_last=True):
         self.max_merged_centroids = max_merged_centroids
         self.distribution = distribution
         self.centroids_ = None
-        super().__init__()
+        super().__init__(channels_last=channels_last)
         return
 
     def fit(self, x, weight=None):
-        self.x_columns_, self.is_array_ = self.extract_x_columns(x)
+        self.x_columns_, self.is_array_ = self.extract_x_columns(x, channels_last=self.channels_last)
         xv = self.extract_array(x)
         if not self._fit:
             # The number of centroids may vary depending on the distribution of each input variable.
@@ -360,7 +369,6 @@ class DQuantileTransformer(DBaseScaler):
             self.centroids_ = np.ones((xv.shape[-1], self.max_merged_centroids, 2)) * np.nan
             for i in range(xv.shape[-1]):
                 td_obj = TDigest.compute(xv[..., i].ravel(), w=weight, compression=self.max_merged_centroids)
-                # td_obj.force_merge()
                 self.centroids_[i, :td_obj._num_merged] = td_obj.get_centroids()
         else:
             td_objs = self.to_digests()
@@ -368,11 +376,19 @@ class DQuantileTransformer(DBaseScaler):
             for i, td_obj in enumerate(td_objs):
                 new_td_obj = TDigest.compute(xv[..., i].ravel(), w=weight, compression=self.max_merged_centroids)
                 combined_td_obj = td_obj + new_td_obj
-                # combined_td_obj.force_merge()
                 new_centroids[i, :combined_td_obj._num_merged] = combined_td_obj.get_centroids()
             self.centroids_ = new_centroids
         self._fit = True
         return
+
+    def force_merge(self):
+        """
+        Trigger a merger of centroids for each variable.
+        """
+        td_objs = self.to_digests()
+        for td_obj in td_objs:
+            td_obj.force_merge()
+        self.to_centroids(td_objs)
 
     def to_digests(self):
         """
