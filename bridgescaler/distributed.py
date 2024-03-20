@@ -4,22 +4,22 @@ from pytdigest import TDigest
 from scipy.stats import norm, logistic
 
 
-
 class DBaseScaler(object):
     """
     Base distributed scaler class. Used only to store attributes and methods shared across all distributed
     scaler subclasses.
     """
-    def __init__(self):
+    def __init__(self, channels_last=True):
         self.x_columns_ = None
         self.is_array_ = False
         self._fit = False
+        self.channels_last = channels_last
 
     def is_fit(self):
         return self._fit
 
     @staticmethod
-    def extract_x_columns(x):
+    def extract_x_columns(x, channels_last=True):
         """
         Extract the variable names to be transformed from x depending on if x is a pandas DataFrame, an
         xarray DataArray, or a numpy array. All of these assume that the columns are in the last dimension.
@@ -28,19 +28,24 @@ class DBaseScaler(object):
 
         Args:
             x (Union[pandas.DataFrame, xarray.DataArray, numpy.ndarray]): array of values to be transformed.
+            channels_last (bool): If True, then assume the variable or channel dimension is the last dimension of the
+                array. If False, then assume the variable or channel dimension is second.
 
         Returns:
             xv (numpy.ndarray): Array of values to be transformed.
             is_array (bool): Whether or not x was a np.ndarray.
         """
         is_array = False
+        var_dim_num = -1
+        if not channels_last:
+            var_dim_num = 1
         if hasattr(x, "columns"):
             x_columns = x.columns.values
         elif hasattr(x, "coords"):
-            var_dim = x.dims[-1]
+            var_dim = x.dims[var_dim_num]
             x_columns = x.coords[var_dim].values
         else:
-            x_columns = np.arange(x.shape[-1])
+            x_columns = np.arange(x.shape[var_dim_num])
             is_array = True
         return x_columns, is_array
 
@@ -91,16 +96,41 @@ class DBaseScaler(object):
             x_packaged = x_transformed
         return x_packaged
 
+    def set_channel_dim(self, channels_last=None):
+        if channels_last is None:
+            channels_last = self.channels_last
+        if channels_last:
+            channel_dim = -1
+        else:
+            channel_dim = 1
+        return channel_dim
+
+    def process_x_for_transform(self, x, channels_last=None):
+        if channels_last is None:
+            channels_last = self.channels_last
+        channel_dim = self.set_channel_dim(channels_last)
+        assert self._fit, "Scaler has not been fit."
+        x_in_cols, is_array = self.extract_x_columns(x, channels_last=channels_last)
+        if is_array:
+            assert x.shape[channel_dim] == self.x_columns_.shape[0], "Number of input columns does not match scaler."
+            x_col_order = np.arange(x.shape[channel_dim])
+        else:
+            x_col_order = self.get_column_order(x_in_cols)
+        xv = self.extract_array(x)
+        x_transformed = np.zeros(xv.shape, dtype=xv.dtype)
+        return xv, x_transformed, channels_last, channel_dim, x_col_order
+
     def fit(self, x, weight=None):
         pass
 
-    def transform(self, x):
+    def transform(self, x, channels_last=None):
         pass
 
-    def fit_transform(self, x):
-        pass
+    def fit_transform(self, x, channels_last=None, weight=None):
+        self.fit(x, weight=weight)
+        return self.transform(x, channels_last=channels_last)
 
-    def inverse_transform(self, x):
+    def inverse_transform(self, x, channels_last=None):
         pass
 
     def __add__(self, other):
@@ -121,67 +151,91 @@ class DStandardScaler(DBaseScaler):
     same form as the original with column or coordinate names preserved.
 
     """
-    def __init__(self):
+    def __init__(self, channels_last=True):
         self.mean_x_ = None
         self.n_ = 0
         self.var_x_ = None
-        super().__init__()
+        super().__init__(channels_last=channels_last)
 
     def fit(self, x, weight=None):
-        self.x_columns_, self.is_array_ = self.extract_x_columns(x)
+        x_columns, is_array = self.extract_x_columns(x, channels_last=self.channels_last)
         xv = self.extract_array(x)
+        channel_dim = self.set_channel_dim()
         if not self._fit:
+            self.x_columns_ = x_columns
+            self.is_array_ = is_array
             self.n_ += xv.shape[0]
-            self.mean_x_ = np.zeros(xv.shape[-1], dtype=xv.dtype)
-            self.var_x_ = np.zeros(xv.shape[-1], dtype=xv.dtype)
-            for i in range(xv.shape[-1]):
-                self.mean_x_[i] = np.nanmean(xv[..., i])
-                self.var_x_[i] = np.nanvar(xv[..., i], ddof=1)
+            self.mean_x_ = np.zeros(xv.shape[channel_dim], dtype=xv.dtype)
+            self.var_x_ = np.zeros(xv.shape[channel_dim], dtype=xv.dtype)
+            if self.channels_last:
+                for i in range(xv.shape[channel_dim]):
+                    self.mean_x_[i] = np.nanmean(xv[..., i])
+                    self.var_x_[i] = np.nanvar(xv[..., i], ddof=1)
+            else:
+                for i in range(xv.shape[channel_dim]):
+                    self.mean_x_[i] = np.nanmean(xv[:, i])
+                    self.var_x_[i] = np.nanvar(xv[:, i], ddof=1)
+
         else:
-            assert x.shape[-1] == self.mean_x_.shape[0], "New data has a different number of columns"
-            # update derived from https://math.stackexchange.com/questions/2971315/how-do-i-combine-standard-deviations-of-two-groups
-            for i in range(x.shape[-1]):
-                new_mean = np.nanmean(xv[..., i])
-                new_var = np.nanvar(xv[..., i], ddof=1)
+            assert x.shape[channel_dim] == self.x_columns_.shape[0], "New data has a different number of columns"
+            if is_array:
+                x_col_order = np.arange(x.shape[-1])
+            else:
+                x_col_order = self.get_column_order(x_columns)
+            # update derived from
+            # https://math.stackexchange.com/questions/2971315/how-do-i-combine-standard-deviations-of-two-groups
+            for i, o in enumerate(x_col_order):
+                if self.channels_last:
+                    new_mean = np.nanmean(xv[..., i])
+                    new_var = np.nanvar(xv[..., i], ddof=1)
+                else:
+                    new_mean = np.nanmean(xv[:, i])
+                    new_var = np.nanvar(xv[:, i], ddof=1)
                 new_n = xv.shape[0]
-                combined_mean = (self.n_ * self.mean_x_[i] + x.shape[0] * new_mean) / (self.n_ + x.shape[0])
-                weighted_var = ((self.n_ - 1) * self.var_x_[i] + (new_n - 1) * new_var) / (self.n_ + new_n - 1)
-                var_correction = self.n_ * new_n * (self.mean_x_[i] - new_mean) ** 2 / (
+                combined_mean = (self.n_ * self.mean_x_[o] + x.shape[0] * new_mean) / (self.n_ + x.shape[0])
+                weighted_var = ((self.n_ - 1) * self.var_x_[o] + (new_n - 1) * new_var) / (self.n_ + new_n - 1)
+                var_correction = self.n_ * new_n * (self.mean_x_[o] - new_mean) ** 2 / (
                         (self.n_ + new_n) * (self.n_ + new_n - 1))
-                self.mean_x_[i] = combined_mean
-                self.var_x_[i] = weighted_var + var_correction
+                self.mean_x_[o] = combined_mean
+                self.var_x_[o] = weighted_var + var_correction
                 self.n_ += new_n
         self._fit = True
 
-    def transform(self, x):
-        assert self._fit, "Scaler has not been fit."
-        x_in_cols, is_array = self.extract_x_columns(x)
-        if is_array:
-            assert x.shape[-1] == self.mean_x_.shape[0], "Number of input columns does not match scaler."
-            x_col_order = np.arange(x.shape[-1])
-        else:
-            x_col_order = self.get_column_order(x_in_cols)
+    def transform(self, x, channels_last=None):
+        """
+        Transform the input data from its original form to standard scaled form. If your input data has a
+        different dimension order than the data used to fit the scaler, use the channels_last keyword argument
+        to specify whether the new data are `channels_last` (True) or `channels_first` (False).
+
+        Args:
+            x: Input data.
+            channels_last: Override the default channels_last parameter of the scaler.
+
+        Returns:
+            x_transformed: Transformed data in the same shape and type as x.
+        """
+        xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
         x_mean, x_var = self.get_scales()
-        x_transformed = (x - x_mean[x_col_order]) / np.sqrt(x_var[x_col_order])
+        if channels_last:
+            for i, o in enumerate(x_col_order):
+                x_transformed[..., i] = (xv[..., i] - x_mean[o]) / np.sqrt(x_var[o])
+        else:
+            for i, o in enumerate(x_col_order):
+                x_transformed[:, i] = (xv[:, i] - x_mean[o]) / np.sqrt(x_var[o])
+        x_transformed_final = self.package_transformed_x(x_transformed, x)
+        return x_transformed_final
+
+    def inverse_transform(self, x, channels_last=None):
+        xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
+        x_mean, x_var = self.get_scales()
+        if channels_last:
+            for i, o in enumerate(x_col_order):
+                x_transformed[..., i] = xv[..., i] * np.sqrt(x_var[o]) + x_mean[o]
+        else:
+            for i, o in enumerate(x_col_order):
+                x_transformed[:, i] = xv[:, i] * np.sqrt(x_var[o]) + x_mean[o]
         x_transformed = self.package_transformed_x(x_transformed, x)
         return x_transformed
-
-    def inverse_transform(self, x):
-        assert self._fit, "Scaler has not been fit."
-        x_in_cols, is_array = self.extract_x_columns(x)
-        if is_array or self.is_array_:
-            assert x.shape[-1] == self.mean_x_.shape[0], "Number of input columns does not match scaler."
-            x_col_order = np.arange(x.shape[-1])
-        else:
-            x_col_order = self.get_column_order(x_in_cols)
-        x_mean, x_var = self.get_scales()
-        x_transformed = x * np.sqrt(x_var[x_col_order]) + x_mean[x_col_order]
-        x_transformed = self.package_transformed_x(x_transformed, x)
-        return x_transformed
-
-    def fit_transform(self, x):
-        self.fit(x)
-        return self.transform(x)
 
     def get_scales(self):
         return self.mean_x_, self.var_x_
@@ -207,54 +261,69 @@ class DMinMaxScaler(DBaseScaler):
     same form as the original with column or coordinate names preserved.
 
     """
-    def __init__(self):
+    def __init__(self, channels_last=True):
         self.max_x_ = None
         self.min_x_ = None
-        super().__init__()
+        super().__init__(channels_last=channels_last)
 
     def fit(self, x, weight=None):
-        self.x_columns_, self.is_array_ = self.extract_x_columns(x)
+        x_columns, is_array = self.extract_x_columns(x, channels_last=self.channels_last)
         xv = self.extract_array(x)
+        channel_dim = self.set_channel_dim()
         if not self._fit:
-            self.max_x_ = np.zeros(xv.shape[-1])
-            self.min_x_ = np.zeros(xv.shape[-1])
-            for i in range(xv.shape[-1]):
-                self.max_x_[i] = np.nanmax(xv[..., i])
-                self.min_x_[i] = np.nanmin(xv[..., i])
-
+            self.x_columns_ = x_columns
+            self.is_array_ = is_array
+            self.max_x_ = np.zeros(xv.shape[channel_dim])
+            self.min_x_ = np.zeros(xv.shape[channel_dim])
+            if self.channels_last:
+                for i in range(xv.shape[channel_dim]):
+                    self.max_x_[i] = np.nanmax(xv[..., i])
+                    self.min_x_[i] = np.nanmin(xv[..., i])
+            else:
+                for i in range(xv.shape[channel_dim]):
+                    self.max_x_[i] = np.nanmax(xv[:, i])
+                    self.min_x_[i] = np.nanmin(xv[:, i])
         else:
-            for i in range(x.shape[-1]):
-                self.max_x_[i] = np.maximum(self.max_x_[i], np.nanmax(xv[..., i]))
-                self.min_x_[i] = np.minimum(self.min_x_[i], np.nanmin(xv[..., i]))
+            assert x.shape[channel_dim] == self.x_columns_.shape[0], "New data has a different number of columns"
+            if is_array:
+                x_col_order = np.arange(x.shape[-1])
+            else:
+                x_col_order = self.get_column_order(x_columns)
+            if self.channels_last:
+                for i, o in enumerate(x_col_order):
+                    self.max_x_[o] = np.maximum(self.max_x_[o], np.nanmax(xv[..., i]))
+                    self.min_x_[o] = np.minimum(self.min_x_[o], np.nanmin(xv[..., i]))
+            else:
+                for i, o in enumerate(xv.shape[channel_dim]):
+                    self.max_x_[o] = np.maximum(self.max_x_[o], np.nanmax(xv[:, i]))
+                    self.min_x_[o] = np.minimum(self.min_x_[o], np.nanmin(xv[:, i]))
         self._fit = True
 
-    def transform(self, x):
-        assert self._fit, "Scaler has not been fit."
-        x_in_cols, is_array = self.extract_x_columns(x)
-        if is_array:
-            assert x.shape[-1] == self.max_x_.shape[0], "Number of input columns does not match scaler."
-            x_col_order = np.arange(x.shape[-1])
+    def transform(self, x, channels_last=None):
+        xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
+        if channels_last:
+            for i, o in enumerate(x_col_order):
+                x_transformed[..., i] = (xv[..., i] - self.min_x_[o]) / (
+                        self.max_x_[o] - self.min_x_[o])
         else:
-            x_col_order = self.get_column_order(x_in_cols)
-        x_transformed = (x - self.min_x_[x_col_order]) / (self.max_x_[x_col_order] - self.min_x_[x_col_order])
+            for i, o in enumerate(x_col_order):
+                x_transformed[:, i] = (xv[:, i] - self.min_x_[o]) / (
+                        self.max_x_[o] - self.min_x_[o])
         x_transformed = self.package_transformed_x(x_transformed, x)
         return x_transformed
 
-    def inverse_transform(self, x):
-        assert self._fit, "Scaler has not been fit."
-        x_in_cols, is_array = self.extract_x_columns(x)
-        if is_array:
-            assert x.shape[-1] == self.max_x_.shape[0], "Number of input columns does not match scaler."
-            x_col_order = np.arange(x.shape[-1])
+    def inverse_transform(self, x, channels_last=None):
+        xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
+        if channels_last:
+            for i, o in enumerate(x_col_order):
+                x_transformed[..., i] = xv[..., i] * (self.max_x_[o] -
+                                                      self.min_x_[o]) + self.min_x_[o]
         else:
-            x_col_order = self.get_column_order(x_in_cols)
-        x_transformed = x * (self.max_x_[x_col_order] - self.min_x_[x_col_order]) + self.min_x_[x_col_order]
+            for i, o in enumerate(x_col_order):
+                x_transformed[:, i] = xv[:, i] * (self.max_x_[o] -
+                                                  self.min_x_[o]) + self.min_x_[o]
         x_transformed = self.package_transformed_x(x_transformed, x)
         return x_transformed
-
-    def fit_transform(self, x):
-        self.fit(x)
-        return self.transform(x)
 
     def get_scales(self):
         return self.min_x_, self.max_x_
@@ -281,16 +350,18 @@ class DQuantileTransformer(DBaseScaler):
     Args:
         max_merged_centroids (int): Maximum number of centroids in TDigest
         distribution (str): Output distribution of transform. Options are "uniform" (default), "normal", and "logistic".
+        channels_last (bool): Whether data will use the last dimension (True) as the channels or variable dim
+            or the second dimension (False).
     """
-    def __init__(self, max_merged_centroids=1000, distribution="uniform"):
+    def __init__(self, max_merged_centroids=1000, distribution="uniform", channels_last=True):
         self.max_merged_centroids = max_merged_centroids
         self.distribution = distribution
         self.centroids_ = None
-        super().__init__()
+        super().__init__(channels_last=channels_last)
         return
 
     def fit(self, x, weight=None):
-        self.x_columns_, self.is_array_ = self.extract_x_columns(x)
+        self.x_columns_, self.is_array_ = self.extract_x_columns(x, channels_last=self.channels_last)
         xv = self.extract_array(x)
         if not self._fit:
             # The number of centroids may vary depending on the distribution of each input variable.
@@ -298,7 +369,6 @@ class DQuantileTransformer(DBaseScaler):
             self.centroids_ = np.ones((xv.shape[-1], self.max_merged_centroids, 2)) * np.nan
             for i in range(xv.shape[-1]):
                 td_obj = TDigest.compute(xv[..., i].ravel(), w=weight, compression=self.max_merged_centroids)
-                td_obj.force_merge()
                 self.centroids_[i, :td_obj._num_merged] = td_obj.get_centroids()
         else:
             td_objs = self.to_digests()
@@ -306,11 +376,19 @@ class DQuantileTransformer(DBaseScaler):
             for i, td_obj in enumerate(td_objs):
                 new_td_obj = TDigest.compute(xv[..., i].ravel(), w=weight, compression=self.max_merged_centroids)
                 combined_td_obj = td_obj + new_td_obj
-                combined_td_obj.force_merge()
                 new_centroids[i, :combined_td_obj._num_merged] = combined_td_obj.get_centroids()
             self.centroids_ = new_centroids
         self._fit = True
         return
+
+    def force_merge(self):
+        """
+        Trigger a merger of centroids for each variable.
+        """
+        td_objs = self.to_digests()
+        for td_obj in td_objs:
+            td_obj.force_merge()
+        self.to_centroids(td_objs)
 
     def to_digests(self):
         """
@@ -333,19 +411,15 @@ class DQuantileTransformer(DBaseScaler):
             centroids[i, :td_objs[i]._num_merged] = td_objs[i].get_centroids()
         return centroids
 
-    def transform(self, x):
-        assert self._fit, "Scaler has not been fit."
-        x_in_cols, is_array = self.extract_x_columns(x)
-        if is_array:
-            assert x.shape[-1] == self.centroids_.shape[0], "Number of input columns does not match scaler."
-            x_col_order = np.arange(x.shape[-1])
-        else:
-            x_col_order = self.get_column_order(x_in_cols)
+    def transform(self, x, channels_last=None):
+        xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
         td_objs = self.to_digests()
-        xv = self.extract_array(x)
-        x_transformed = np.zeros(xv.shape, dtype=xv.dtype)
-        for i, o in enumerate(x_col_order):
-            x_transformed[..., i] = np.reshape(td_objs[o].cdf(xv[..., i].ravel()), xv[..., i].shape)
+        if channels_last:
+            for i, o in enumerate(x_col_order):
+                x_transformed[..., i] = np.reshape(td_objs[o].cdf(xv[..., i].ravel()), xv[..., i].shape)
+        else:
+            for i, o in enumerate(x_col_order):
+                x_transformed[:, i] = np.reshape(td_objs[o].cdf(xv[:, i].ravel()), xv[:, i].shape)
         if self.distribution == "normal":
             x_transformed = norm.ppf(x_transformed)
         elif self.distribution == "logistic":
@@ -353,27 +427,21 @@ class DQuantileTransformer(DBaseScaler):
         x_transformed = self.package_transformed_x(x_transformed, x)
         return x_transformed
 
-    def fit_transform(self, x, weight=None):
-        self.fit(x, weight=weight)
-        return self.transform(x)
-
-    def inverse_transform(self, x):
-        assert self._fit, "Scaler has not been fit."
-        x_in_cols, is_array = self.extract_x_columns(x)
-        if is_array:
-            assert x.shape[-1] == self.centroids_.shape[0], "Number of input columns does not match scaler."
-            x_col_order = np.arange(x.shape[-1])
-        else:
-            x_col_order = self.get_column_order(x_in_cols)
-        xv = self.extract_array(x)
-        x_transformed = np.zeros(xv.shape, dtype=xv.dtype)
+    def inverse_transform(self, x, channels_last=None):
+        xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
         td_objs = self.to_digests()
         if self.distribution == "normal":
             x_transformed = norm.cdf(xv)
         elif self.distribution == "logistic":
             x_transformed = logistic.cdf(xv)
-        for i, o in enumerate(x_col_order):
-            x_transformed[..., i] = np.reshape(td_objs[o].inverse_cdf(x_transformed[..., i].ravel()), xv[..., i].shape)
+        if channels_last:
+            for i, o in enumerate(x_col_order):
+                x_transformed[..., i] = np.reshape(td_objs[o].inverse_cdf(x_transformed[..., i].ravel()),
+                                                   xv[..., i].shape)
+        else:
+            for i, o in enumerate(x_col_order):
+                x_transformed[:, i] = np.reshape(td_objs[o].inverse_cdf(x_transformed[:, i].ravel()),
+                                                xv[:, i].shape)
         x_transformed = self.package_transformed_x(x_transformed, x)
         return x_transformed
 
