@@ -361,22 +361,43 @@ class DQuantileTransformer(DBaseScaler):
         return
 
     def fit(self, x, weight=None):
-        self.x_columns_, self.is_array_ = self.extract_x_columns(x, channels_last=self.channels_last)
+        x_columns, is_array = self.extract_x_columns(x, channels_last=self.channels_last)
         xv = self.extract_array(x)
+        channel_dim = self.set_channel_dim()
         if not self._fit:
+            self.x_columns_ = x_columns
+            self.is_array_ = is_array
             # The number of centroids may vary depending on the distribution of each input variable.
             # The extra spots at the end are padded with nans.
             self.centroids_ = np.ones((xv.shape[-1], self.max_merged_centroids, 2)) * np.nan
-            for i in range(xv.shape[-1]):
-                td_obj = TDigest.compute(xv[..., i].ravel(), w=weight, compression=self.max_merged_centroids)
-                self.centroids_[i, :td_obj._num_merged] = td_obj.get_centroids()
+            if self.channels_last:
+                for i in range(xv.shape[channel_dim]):
+                    td_obj = TDigest.compute(xv[..., i].ravel(), w=weight, compression=self.max_merged_centroids)
+                    self.centroids_[i, :td_obj._num_merged] = td_obj.get_centroids()
+            else:
+                for i in range(xv.shape[channel_dim]):
+                    td_obj = TDigest.compute(xv[:, i].ravel(), w=weight, compression=self.max_merged_centroids)
+                    self.centroids_[i, :td_obj._num_merged] = td_obj.get_centroids()
         else:
+            assert x.shape[channel_dim] == self.x_columns_.shape[0], "New data has a different number of columns"
+            if is_array:
+                x_col_order = np.arange(x.shape[-1])
+            else:
+                x_col_order = self.get_column_order(x_columns)
             td_objs = self.to_digests()
             new_centroids = np.ones((xv.shape[-1], self.max_merged_centroids, 2)) * np.nan
-            for i, td_obj in enumerate(td_objs):
-                new_td_obj = TDigest.compute(xv[..., i].ravel(), w=weight, compression=self.max_merged_centroids)
-                combined_td_obj = td_obj + new_td_obj
-                new_centroids[i, :combined_td_obj._num_merged] = combined_td_obj.get_centroids()
+            if self.channels_last:
+                for i, o in enumerate(x_col_order):
+                    td_obj = td_objs[o]
+                    new_td_obj = TDigest.compute(xv[..., i].ravel(), w=weight, compression=self.max_merged_centroids)
+                    combined_td_obj = td_obj + new_td_obj
+                    new_centroids[i, :combined_td_obj._num_merged] = combined_td_obj.get_centroids()
+            else:
+                for i, o in enumerate(x_col_order):
+                    td_obj = td_objs[o]
+                    new_td_obj = TDigest.compute(xv[:, i].ravel(), w=weight, compression=self.max_merged_centroids)
+                    combined_td_obj = td_obj + new_td_obj
+                    new_centroids[i, :combined_td_obj._num_merged] = combined_td_obj.get_centroids()
             self.centroids_ = new_centroids
         self._fit = True
         return
@@ -416,10 +437,12 @@ class DQuantileTransformer(DBaseScaler):
         td_objs = self.to_digests()
         if channels_last:
             for i, o in enumerate(x_col_order):
-                x_transformed[..., i] = np.reshape(td_objs[o].cdf(xv[..., i].ravel()), xv[..., i].shape)
+                xd = xv[..., i].ravel().astype("float64")
+                x_transformed[..., i] = np.reshape(td_objs[o].cdf(xd), xv[..., i].shape)
         else:
             for i, o in enumerate(x_col_order):
-                x_transformed[:, i] = np.reshape(td_objs[o].cdf(xv[:, i].ravel()), xv[:, i].shape)
+                xd = xv[:, i].ravel().astype("float64")
+                x_transformed[:, i] = np.reshape(td_objs[o].cdf(xd), xv[:, i].shape)
         if self.distribution == "normal":
             x_transformed = norm.ppf(x_transformed)
         elif self.distribution == "logistic":
@@ -436,12 +459,14 @@ class DQuantileTransformer(DBaseScaler):
             x_transformed = logistic.cdf(xv)
         if channels_last:
             for i, o in enumerate(x_col_order):
-                x_transformed[..., i] = np.reshape(td_objs[o].inverse_cdf(x_transformed[..., i].ravel()),
+                xd = x_transformed[..., i].ravel().astype("float64")
+                x_transformed[..., i] = np.reshape(td_objs[o].inverse_cdf(xd),
                                                    xv[..., i].shape)
         else:
             for i, o in enumerate(x_col_order):
-                x_transformed[:, i] = np.reshape(td_objs[o].inverse_cdf(x_transformed[:, i].ravel()),
-                                                xv[:, i].shape)
+                xd = x_transformed[:, i].ravel().astype("float64")
+                x_transformed[:, i] = np.reshape(td_objs[o].inverse_cdf(xd),
+                                                 xv[:, i].shape)
         x_transformed = self.package_transformed_x(x_transformed, x)
         return x_transformed
 
