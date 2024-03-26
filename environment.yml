@@ -16,3 +16,4 @@ dependencies:
   - pip:
     - sphinx-book-theme
     - pytdigest
+    - .
