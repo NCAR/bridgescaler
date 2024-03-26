@@ -475,7 +475,7 @@ class DQuantileScaler(DBaseScaler):
                     x_col_order = self.get_column_order(x_columns)
                 td_objs = self.attributes_to_td_objs()
                 fit_var_func = partial(fit_variable,
-                                       xv_pointer=xv_shared,
+                                       xv_shared=xv_shared,
                                        compression=self.compression,
                                        channels_last=self.channels_last)
                 with Pool(n_jobs) as pool:
