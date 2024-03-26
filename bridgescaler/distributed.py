@@ -446,6 +446,10 @@ class DQuantileScaler(DBaseScaler):
         return td_objs
 
     def fit(self, x, weight=None, n_jobs=1):
+        if isinstance(n_jobs, int):
+            pool = Pool(n_jobs)
+        else:
+            pool = n_jobs
         x_columns, is_array = self.extract_x_columns(x, channels_last=self.channels_last)
         with SharedMemoryManager() as smm:
             xv = self.extract_array(x)
@@ -464,8 +468,7 @@ class DQuantileScaler(DBaseScaler):
                                        xv_shared=xv_shared,
                                        compression=self.compression,
                                        channels_last=self.channels_last)
-                with Pool(n_jobs) as pool:
-                    td_objs = pool.map(fit_var_func, np.arange(xv.shape[channel_dim]))
+                td_objs = pool.map(fit_var_func, np.arange(xv.shape[channel_dim]))
                 self.td_objs_to_attributes(td_objs)
             else:
                 assert x.shape[channel_dim] == self.x_columns_.shape[0], "New data has a different number of columns"
@@ -478,8 +481,7 @@ class DQuantileScaler(DBaseScaler):
                                        xv_shared=xv_shared,
                                        compression=self.compression,
                                        channels_last=self.channels_last)
-                with Pool(n_jobs) as pool:
-                    new_td_objs = pool.map(fit_var_func, np.arange(xv.shape[channel_dim]))
+                new_td_objs = pool.map(fit_var_func, np.arange(xv.shape[channel_dim]))
                 for i, o in enumerate(x_col_order):
                     td_objs[o].merge(new_td_objs[i])
                 self.td_objs_to_attributes(td_objs)
