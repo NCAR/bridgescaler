@@ -176,11 +176,11 @@ def test_dquantile_scaler():
     dsses_4d = []
     for n in range(test_data["n_examples"].size):
         dsses_2d.append(DQuantileScaler())
-        dsses_2d[-1].fit(test_data["numpy_2d"][n])
+        dsses_2d[-1].fit(test_data["numpy_2d"][n], n_jobs=2)
         dsses_4d.append(DQuantileScaler())
-        dsses_4d[-1].fit(test_data["numpy_4d"][n])
-        ds_2d_transformed = dsses_2d[-1].transform(test_data["numpy_2d"][n])
-        ds_4d_transformed = dsses_4d[-1].transform(test_data["numpy_4d"][n])
+        dsses_4d[-1].fit(test_data["numpy_4d"][n], n_jobs=2)
+        ds_2d_transformed = dsses_2d[-1].transform(test_data["numpy_2d"][n], n_jobs=2)
+        ds_4d_transformed = dsses_4d[-1].transform(test_data["numpy_4d"][n], n_jobs=2)
         ds_2d_it = dsses_2d[-1].inverse_transform(ds_2d_transformed)
         ds_4d_it = dsses_4d[-1].inverse_transform(ds_4d_transformed)
         assert ds_2d_transformed.max() <= 1, "Quantile transform > 1"
@@ -191,18 +191,18 @@ def test_dquantile_scaler():
         assert np.nanargmax(np.abs((new_scaler.min_ - dsses_2d[-1].min_))) == 0, \
             "Differences in scaler centroid values after loading"
     pd_dss = DQuantileScaler()
-    pd_trans = pd_dss.fit_transform(test_data["pandas"][0])
+    pd_trans = pd_dss.fit_transform(test_data["pandas"][0], n_jobs=2)
     pd_inv_trans = pd_dss.inverse_transform(pd_trans)
     sub_cols = ["d", "b"]
-    pd_sub_trans = pd_dss.transform(test_data["pandas"][0][sub_cols])
+    pd_sub_trans = pd_dss.transform(test_data["pandas"][0][sub_cols], n_jobs=2)
     assert pd_sub_trans.shape[1] == len(sub_cols), "Did not subset properly"
-    pd_sub_inv_trans = pd_dss.inverse_transform(pd_sub_trans)
+    pd_sub_inv_trans = pd_dss.inverse_transform(pd_sub_trans, n_jobs=2)
     assert pd_sub_inv_trans.shape[1] == len(sub_cols), "Did not subset properly on inverse."
     assert type(pd_trans) is type(test_data["pandas"][0]), "Pandas DataFrame type not passed through transform"
     assert type(pd_inv_trans) is type(test_data["pandas"][0]), "Pandas DataFrame type not passed through inverse"
     xr_dss = DQuantileScaler(distribution="normal")
-    xr_trans = xr_dss.fit_transform(test_data["xarray"][0])
-    xr_inv_trans = xr_dss.inverse_transform(xr_trans)
+    xr_trans = xr_dss.fit_transform(test_data["xarray"][0], n_jobs=2)
+    xr_inv_trans = xr_dss.inverse_transform(xr_trans, n_jobs=2)
     assert np.all(~np.isnan(xr_trans)), "nans in transform"
     assert np.all(~np.isnan(xr_inv_trans)), "nans in inverse transform"
     assert xr_trans.shape == test_data["xarray"][0].shape, "shape does not match"
@@ -212,12 +212,12 @@ def test_dquantile_scaler():
     assert combined_scaler.size_[0] == test_data["n_examples"].sum(), \
         "Summing did not work properly."
     test_data_c_first = test_data["xarray"][0].transpose("batch", "variable", "y", "x").astype("float32")
-    xr_dss_first = xr_dss.transform(test_data_c_first, channels_last=False)
-    xr_inv_dss_first = xr_dss.inverse_transform(xr_dss_first, channels_last=False)
+    xr_dss_first = xr_dss.transform(test_data_c_first, channels_last=False, n_jobs=2)
+    xr_inv_dss_first = xr_dss.inverse_transform(xr_dss_first, channels_last=False, n_jobs=2)
     assert xr_dss_first.shape == xr_inv_dss_first.shape, "shape does not match"
     xr_dss_f = DQuantileScaler(distribution="normal", channels_last=False)
-    xr_dss_f.fit(test_data_c_first)
-    scaled_data_quantile_first = xr_dss_f.transform(test_data_c_first)
+    xr_dss_f.fit(test_data_c_first, n_jobs=2)
+    scaled_data_quantile_first = xr_dss_f.transform(test_data_c_first, n_jobs=2)
     assert scaled_data_quantile_first.shape == test_data_c_first.shape
     return
 

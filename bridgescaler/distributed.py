@@ -415,7 +415,7 @@ class DQuantileScaler(DBaseScaler):
     processes to minimize inter-process communication.
 
     """
-    def __init__(self, compression=500, distribution="uniform", min_val=0.0000001, max_val=0.9999999, channels_last=True):
+    def __init__(self, compression=250, distribution="uniform", min_val=0.0000001, max_val=0.9999999, channels_last=True):
         self.compression = compression
         self.distribution = distribution
         self.min_val = min_val
