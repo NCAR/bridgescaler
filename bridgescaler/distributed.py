@@ -1,15 +1,13 @@
 import numpy as np
+from numpy.lib.recfunctions import structured_to_unstructured, unstructured_to_structured
 from copy import deepcopy
 from crick import TDigest as CTDigest
-from scipy.stats import norm, logistic
+from numba_stats import norm
 import pandas as pd
 import xarray as xr
 from pytdigest import TDigest
-from multiprocessing import Pool
-from multiprocessing.shared_memory import SharedMemory
-from multiprocessing.managers import SharedMemoryManager
 from functools import partial
-
+from scipy.stats import logistic
 
 CENTROID_DTYPE = np.dtype([('mean', np.float64), ('weight', np.float64)])
 
@@ -345,8 +343,7 @@ class DMinMaxScaler(DBaseScaler):
 
 
 def fit_variable(var_index, xv_shared=None, compression=None, channels_last=None):
-    xv_mem = SharedMemory(name=xv_shared["name"])
-    xv = np.ndarray(xv_shared["shape"], dtype=xv_shared["dtype"], buffer=xv_mem.buf)
+    xv = xv_shared
     td_obj = CTDigest(compression=compression)
     if channels_last:
         td_obj.update(xv[..., var_index].ravel())
@@ -355,56 +352,23 @@ def fit_variable(var_index, xv_shared=None, compression=None, channels_last=None
     return td_obj
 
 
-def transform_variable(td_i_obj, xvs=None, x_trans_s=None, channels_last=None,
-                       min_val=None, max_val=None, distribution=None):
-    xv_mem = SharedMemory(name=xvs["name"])
-    xt_mem = SharedMemory(name=x_trans_s["name"])
-    i = td_i_obj[0]
-    td_obj = td_i_obj[1]
-    xv = np.ndarray(xvs["shape"], dtype=xvs["dtype"], buffer=xv_mem.buf)
-    x_transformed = np.ndarray(x_trans_s["shape"], dtype=x_trans_s["dtype"],
-                               buffer=xt_mem.buf)
-    if channels_last:
-        x_transformed[..., i] = td_obj.cdf(xv[..., i])
-        x_transformed[..., i] = np.minimum(x_transformed[..., i], max_val)
-        x_transformed[..., i] = np.maximum(x_transformed[..., i], min_val)
-        if distribution == "normal":
-            x_transformed[..., i] = norm.ppf(x_transformed[..., i])
-        elif distribution == "logistic":
-            x_transformed[..., i] = logistic.ppf(x_transformed[..., i])
-    else:
-        x_transformed[:, i] = td_obj.cdf(xv[:, i])
-        x_transformed[:, i] = np.minimum(x_transformed[:, i], max_val)
-        x_transformed[:, i] = np.maximum(x_transformed[:, i], min_val)
-        if distribution == "normal":
-            x_transformed[:, i] = norm.ppf(x_transformed[:, i])
-        elif distribution == "logistic":
-            x_transformed[:, i] = logistic.ppf(x_transformed[:, i])
-    return
+def transform_variable(td_obj, xv,
+                       min_val=0.000001, max_val=0.9999999, distribution="normal"):
+    x_transformed = td_obj.cdf(xv)
+    x_transformed[:] = np.minimum(x_transformed, max_val)
+    x_transformed[:] = np.maximum(x_transformed, min_val)
+    if distribution == "normal":
+        x_transformed[:] = norm.ppf(x_transformed, loc=0, scale=1)
+    return x_transformed
 
 
-def inv_transform_variable(td_i_obj, xvs=None, x_trans_s=None, channels_last=None,
-                           distribution=None):
-    xv_mem = SharedMemory(name=xvs["name"])
-    xt_mem = SharedMemory(name=x_trans_s["name"])
-    i = td_i_obj[0]
-    td_obj = td_i_obj[1]
-    xv = np.ndarray(xvs["shape"], dtype=xvs["dtype"], buffer=xv_mem.buf)
-    x_transformed = np.ndarray(x_trans_s["shape"], dtype=x_trans_s["dtype"],
-                               buffer=xt_mem.buf)
-    if channels_last:
-        if distribution == "normal":
-            x_transformed[..., i] = norm.cdf(xv[..., i])
-        elif distribution == "logistic":
-            x_transformed[..., i] = logistic.cdf(xv[..., i])
-        x_transformed[..., i] = td_obj.quantile(x_transformed[..., i])
-    else:
-        if distribution == "normal":
-            x_transformed[:, i] = norm.cdf(xv[:, i])
-        elif distribution == "logistic":
-            x_transformed[:, i] = logistic.cdf(xv[:, i])
-        x_transformed[:, i] = td_obj.quantile(x_transformed[:, i])
-    return
+def inv_transform_variable(td_obj, xv,
+                           distribution="normal"):
+    x_transformed = np.zeros(xv.shape, dtype=xv.dtype)
+    if distribution == "normal":
+        x_transformed = norm.cdf(xv, loc=0, scale=1)
+    x_transformed[:] = td_obj.quantile(x_transformed)
+    return x_transformed
 
 
 class DQuantileScaler(DBaseScaler):
@@ -428,7 +392,7 @@ class DQuantileScaler(DBaseScaler):
         super().__init__(channels_last=channels_last)
 
     def td_objs_to_attributes(self, td_objs):
-        self.centroids_ = [td_obj.centroids().tolist() for td_obj in td_objs]
+        self.centroids_ = [structured_to_unstructured(td_obj.centroids()) for td_obj in td_objs]
         self.size_ = np.array([td_obj.size() for td_obj in td_objs])
         self.min_ = np.array([td_obj.min() for td_obj in td_objs])
         self.max_ = np.array([td_obj.max() for td_obj in td_objs])
@@ -439,124 +403,122 @@ class DQuantileScaler(DBaseScaler):
         if self.is_fit():
             for i in range(self.max_.size):
                 td_objs.append(CTDigest(self.compression))
-                td_objs[-1].__setstate__((np.array(self.centroids_[i], dtype=CENTROID_DTYPE),
+                td_objs[-1].__setstate__((unstructured_to_structured(self.centroids_[i], CENTROID_DTYPE),
                                           self.size_[i],
                                           self.min_[i],
                                           self.max_[i]))
         return td_objs
 
-    def fit(self, x, weight=None, n_jobs=1):
-        if isinstance(n_jobs, int):
-            pool = Pool(n_jobs)
-        else:
-            pool = n_jobs
+    def fit(self, x, weight=None):
         x_columns, is_array = self.extract_x_columns(x, channels_last=self.channels_last)
-        with SharedMemoryManager() as smm:
-            xv = self.extract_array(x)
-            xv_mem = smm.SharedMemory(xv.nbytes)
-            xv_shared = dict(name=xv_mem.name)
-            xv_shared["shape"] = xv.shape
-            xv_shared["dtype"] = xv.dtype
-            xv_shared_array = np.ndarray(xv.shape, dtype=xv.dtype, buffer=xv_mem.buf)
-            xv_shared_array[:] = xv[:]
-            channel_dim = self.set_channel_dim()
-
-            if not self._fit:
-                self.x_columns_ = x_columns
-                self.is_array_ = is_array
-                fit_var_func = partial(fit_variable,
-                                       xv_shared=xv_shared,
-                                       compression=self.compression,
-                                       channels_last=self.channels_last)
-                td_objs = pool.map(fit_var_func, np.arange(xv.shape[channel_dim]))
-                self.td_objs_to_attributes(td_objs)
+        xv = self.extract_array(x)
+        channel_dim = self.set_channel_dim()
+        if not self._fit:
+            self.x_columns_ = x_columns
+            self.is_array_ = is_array
+            fit_var_func = partial(fit_variable,
+                                   xv_shared=xv,
+                                   compression=self.compression,
+                                   channels_last=self.channels_last)
+            td_objs = [fit_var_func(x) for x in np.arange(xv.shape[channel_dim])]
+            self.td_objs_to_attributes(td_objs)
+        else:
+            assert x.shape[channel_dim] == self.x_columns_.shape[0], "New data has a different number of columns"
+            if is_array:
+                x_col_order = np.arange(x.shape[-1])
             else:
-                assert x.shape[channel_dim] == self.x_columns_.shape[0], "New data has a different number of columns"
-                if is_array:
-                    x_col_order = np.arange(x.shape[-1])
-                else:
-                    x_col_order = self.get_column_order(x_columns)
-                td_objs = self.attributes_to_td_objs()
-                fit_var_func = partial(fit_variable,
-                                       xv_shared=xv_shared,
-                                       compression=self.compression,
-                                       channels_last=self.channels_last)
-                new_td_objs = pool.map(fit_var_func, np.arange(xv.shape[channel_dim]))
-                for i, o in enumerate(x_col_order):
-                    td_objs[o].merge(new_td_objs[i])
-                self.td_objs_to_attributes(td_objs)
+                x_col_order = self.get_column_order(x_columns)
+            td_objs = self.attributes_to_td_objs()
+            fit_var_func = partial(fit_variable,
+                                   xv_shared=xv,
+                                   compression=self.compression,
+                                   channels_last=self.channels_last)
+            new_td_objs = [fit_var_func(x) for x in np.arange(xv.shape[channel_dim])]
+            for i, o in enumerate(x_col_order):
+                td_objs[o].merge(new_td_objs[i])
+            self.td_objs_to_attributes(td_objs)
         self._fit = True
         return
 
-    def transform(self, x, channels_last=None, n_jobs=1):
+    def transform(self, x, channels_last=None, pool=None):
         xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
         td_objs = self.attributes_to_td_objs()
         td_i_objs = [(i, td_objs[o]) for i, o in enumerate(x_col_order)]
-        with (SharedMemoryManager() as smm):
-            xv_mem = smm.SharedMemory(xv.nbytes)
-            xv_shared = dict(name=xv_mem.name)
-            xv_shared["shape"] = xv.shape
-            xv_shared["dtype"] = xv.dtype
-            xv_shared_array = np.ndarray(xv.shape, dtype=xv.dtype, buffer=xv_mem.buf)
-            xv_shared_array[:] = xv[:]
-            xt_mem = smm.SharedMemory(x_transformed.nbytes)
-            x_trans_shared = dict(name=xt_mem.name)
-            x_trans_shared["shape"] = x_transformed.shape
-            x_trans_shared["dtype"] = x_transformed.dtype
-            x_trans_shared_array = np.ndarray(x_trans_shared["shape"], dtype=x_trans_shared["dtype"],
-                                                buffer=xt_mem.buf)
 
-            trans_var_func = partial(transform_variable, xvs=xv_shared, x_trans_s=x_trans_shared,
-                                     channels_last=channels_last, min_val=self.min_val, max_val=self.max_val,
-                                     distribution=self.distribution)
-            with Pool(n_jobs) as pool:
-                pool.map(trans_var_func, td_i_objs)
-            x_transformed[:] = x_trans_shared_array[:]
+        trans_var_func = partial(transform_variable,
+                                 min_val=self.min_val, max_val=self.max_val,
+                                 distribution=self.distribution)
+        if channels_last:
+            if pool is not None:
+                split_indices = np.round(np.linspace(0, xv[..., 0].size, pool._processes)).astype(int)
+                xt_shape = x_transformed[..., 0].shape
+                outputs = []
+                for td_obj in td_i_objs:
+                    for s, s_ind in enumerate(split_indices[1:]):
+                        outputs.append(pool.apply_async(trans_var_func, (td_obj[1],
+                                                        xv[..., td_obj[0]].ravel()[split_indices[s]:s_ind])))
+                    x_transformed[..., td_obj[0]] = np.reshape(np.concatenate([o.get() for o in outputs]), xt_shape)
+                    del outputs[:]
+            else:
+                for td_obj in td_i_objs:
+                    x_transformed[..., td_obj[0]] = trans_var_func(td_obj[1], xv[..., td_obj[0]])
+        else:
+            if pool is not None:
+                split_indices = np.round(np.linspace(0, xv[..., 0].size, pool._processes)).astype(int)
+                xt_shape = x_transformed[:, 0].shape
+                outputs = []
+                for td_obj in td_i_objs:
+                    for s, s_ind in enumerate(split_indices[1:]):
+                        outputs.append(pool.apply_async(trans_var_func, (td_obj[1],
+                                                        xv[..., td_obj[0]].ravel()[split_indices[s]:s_ind])))
+                    x_transformed[:, td_obj[0]] = np.reshape(np.concatenate([o.get() for o in outputs]), xt_shape)
+                    del outputs[:]
+            else:
+                for td_obj in td_i_objs:
+                    x_transformed[:, td_obj[0]] = trans_var_func(td_obj[1], xv[:, td_obj[0]])
         x_transformed_final = self.package_transformed_x(x_transformed, x)
         return x_transformed_final
 
-    def fit_transform(self, x, channels_last=None, weight=None, n_jobs=1):
-        self.fit(x, weight=weight, n_jobs=n_jobs)
-        return self.transform(x, channels_last=channels_last, n_jobs=n_jobs)
+    def fit_transform(self, x, channels_last=None, weight=None, pool=None):
+        self.fit(x, weight=weight)
+        return self.transform(x, channels_last=channels_last, pool=pool)
 
-    def inverse_transform(self, x, channels_last=None, n_jobs=1):
+    def inverse_transform(self, x, channels_last=None, pool=None):
         xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
         td_objs = self.attributes_to_td_objs()
         td_i_objs = [(i, td_objs[o]) for i, o in enumerate(x_col_order)]
-        with SharedMemoryManager() as smm:
-            xv_mem = smm.SharedMemory(xv.nbytes)
-            xv_shared = dict(name=xv_mem.name)
-            xv_shared["shape"] = xv.shape
-            xv_shared["dtype"] = xv.dtype
-            xv_shared_array = np.ndarray(xv.shape, dtype=xv.dtype, buffer=xv_mem.buf)
-            xv_shared_array[:] = xv[:]
-            xt_mem = smm.SharedMemory(x_transformed.nbytes)
-            x_trans_shared = dict(name=xt_mem.name)
-            x_trans_shared["shape"] = x_transformed.shape
-            x_trans_shared["dtype"] = x_transformed.dtype
-            x_trans_shared_array = np.ndarray(x_trans_shared["shape"], dtype=x_trans_shared["dtype"],
-                                              buffer=xt_mem.buf)
-
-            trans_var_func = partial(inv_transform_variable, xvs=xv_shared, x_trans_s=x_trans_shared,
-                                     channels_last=channels_last,
-                                     distribution=self.distribution)
-            with Pool(n_jobs) as pool:
-                pool.map(trans_var_func, td_i_objs)
-            x_transformed[:] = x_trans_shared_array[:]
-        x_transformed = self.package_transformed_x(x_transformed, x)
-        return x_transformed
-
-    def __iadd__(self, other):
-        td_objs = self.attributes_to_td_objs()
-        other_td_objs = other.attributes_to_td_objs()
-        assert type(other) is DQuantileScaler, "Adding mismatched scaler types."
-        assert self.is_fit() and other.is_fit(), "At least one scaler is not fit."
-        x_col_order = self.get_column_order(other.x_columns_)
-        assert x_col_order.size > 0, "No matching columns in other DQuantileScaler"
-        for i, o in enumerate(x_col_order):
-            td_objs[o].merge(other_td_objs[i])
-        self.td_objs_to_attributes(td_objs)
-        return self
+        inv_trans_var_func = partial(inv_transform_variable,
+                                 distribution=self.distribution)
+        if channels_last:
+            if pool is not None:
+                split_indices = np.round(np.linspace(0, xv[..., 0].size, pool._processes)).astype(int)
+                xt_shape = x_transformed[..., 0].shape
+                outputs = []
+                for td_obj in td_i_objs:
+                    for s, s_ind in enumerate(split_indices[1:]):
+                        outputs.append(pool.apply_async(inv_trans_var_func, (td_obj[1],
+                                                        xv[..., td_obj[0]].ravel()[split_indices[s]:s_ind])))
+                    x_transformed[..., td_obj[0]] = np.reshape(np.concatenate([o.get() for o in outputs]), xt_shape)
+                    del outputs[:]
+            else:
+                for td_obj in td_i_objs:
+                    x_transformed[..., td_obj[0]] = inv_trans_var_func(td_obj[1], xv[:, td_obj[0]])
+        else:
+            if pool is not None:
+                split_indices = np.round(np.linspace(0, xv[..., 0].size, pool._processes)).astype(int)
+                xt_shape = x_transformed[:, 0].shape
+                outputs = []
+                for td_obj in td_i_objs:
+                    for s, s_ind in enumerate(split_indices[1:]):
+                        outputs.append(pool.apply_async(inv_trans_var_func, (td_obj[1],
+                                                        xv[..., td_obj[0]].ravel()[split_indices[s]:s_ind])))
+                    x_transformed[:, td_obj[0]] = np.reshape(np.concatenate([o.get() for o in outputs]), xt_shape)
+                    del outputs[:]
+            else:
+                for td_obj in td_i_objs:
+                    x_transformed[:, td_obj[0]] = inv_trans_var_func(td_obj[1], xv[:, td_obj[0]])
+        x_transformed_final = self.package_transformed_x(x_transformed, x)
+        return x_transformed_final
 
     def __add__(self, other):
         current = deepcopy(self)
@@ -679,7 +641,7 @@ class DQuantileTransformer(DBaseScaler):
                 xd = xv[:, i].ravel().astype("float64")
                 x_transformed[:, i] = np.reshape(td_objs[o].cdf(xd), xv[:, i].shape)
         if self.distribution == "normal":
-            x_transformed = norm.ppf(x_transformed)
+            x_transformed = norm.ppf(x_transformed, loc=0, scale=1)
         elif self.distribution == "logistic":
             x_transformed = logistic.ppf(x_transformed)
         x_transformed = self.package_transformed_x(x_transformed, x)
@@ -689,7 +651,7 @@ class DQuantileTransformer(DBaseScaler):
         xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
         td_objs = self.to_digests()
         if self.distribution == "normal":
-            x_transformed = norm.cdf(xv)
+            x_transformed = norm.cdf(xv, loc=0, scale=1)
         elif self.distribution == "logistic":
             x_transformed = logistic.cdf(xv)
         if channels_last:
