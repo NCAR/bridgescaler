@@ -5,4 +5,5 @@ crick
 xarray
 scipy>=1.11.0
 pytdigest
+numba-stats
 

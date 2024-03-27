@@ -6,6 +6,10 @@ from bridgescaler.distributed import DStandardScaler, DMinMaxScaler, DQuantileTr
 import numpy as np
 import json
 import pandas as pd
+from numpy.lib.format import descr_to_dtype, dtype_to_descr
+from base64 import b64decode, b64encode
+from typing import Any
+
 
 scaler_objs = {"StandardScaler": StandardScaler,
                "MinMaxScaler": MinMaxScaler,
@@ -56,6 +60,14 @@ def print_scaler(scaler):
     return json.dumps(scaler_params, indent=4, sort_keys=True, cls=NumpyEncoder)
 
 
+def object_hook(dct: dict[Any, Any]) -> dict[Any, Any] | np.ndarray | np.generic:
+    if "__numpy__" in dct:
+        np_obj = np.frombuffer(
+            b64decode(dct["__numpy__"]), descr_to_dtype(dct["dtype"])
+        )
+        return np_obj.reshape(shape) if (shape := dct["shape"]) else np_obj[0]
+    return dct
+
 def read_scaler(scaler_str):
     """
     Initialize scikit-learn or bridgescaler scaler from json str.
@@ -66,11 +78,11 @@ def read_scaler(scaler_str):
     Returns:
         scaler object.
     """
-    scaler_params = json.loads(scaler_str)
+    scaler_params = json.loads(scaler_str, object_hook=object_hook)
     scaler = scaler_objs[scaler_params["type"]]()
     del scaler_params["type"]
     for k, v in scaler_params.items():
-        if type(v) is dict:
+        if isinstance(v, dict) and v["object"] == "ndarray":
             setattr(scaler, k, np.array(v['data'], dtype=v['dtype']).reshape(v['shape']))
         else:
             setattr(scaler, k, v)
@@ -108,9 +120,18 @@ class NumpyEncoder(json.JSONEncoder):
         elif isinstance(obj, (np.complex_, np.complex64, np.complex128)):
             return {'real': obj.real, 'imag': obj.imag}
 
-        elif isinstance(obj, (np.ndarray,)):
+        elif isinstance(obj, (np.ndarray,)) and obj.dtype == "|O":
             return {'object': 'ndarray', 'dtype': obj.dtype.str, 'shape': list(obj.shape),
                     'data': obj.ravel().tolist()}
+
+        elif isinstance(obj, (np.ndarray, np.generic)):
+            return {
+                "__numpy__": b64encode(
+                    obj.data if obj.flags.c_contiguous else obj.tobytes()
+                ).decode(),
+                "dtype": dtype_to_descr(obj.dtype),
+                "shape": obj.shape,
+            }
 
         elif isinstance(obj, (np.bool_)):
             return bool(obj)

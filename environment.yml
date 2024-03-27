@@ -13,6 +13,7 @@ dependencies:
   - sphinx
   - xarray
   - crick
+  - numba-stats
   - pip:
     - sphinx-book-theme
     - pytdigest
