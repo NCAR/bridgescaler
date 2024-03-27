@@ -3,7 +3,7 @@ from bridgescaler.backend import create_synthetic_data
 import numpy as np
 import os
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, QuantileTransformer
-from bridgescaler.distributed import DStandardScaler, DMinMaxScaler, DQuantileTransformer
+from bridgescaler.distributed import DStandardScaler, DMinMaxScaler, DQuantileTransformer, DQuantileScaler
 from pandas import DataFrame
 from os.path import exists
 
@@ -14,7 +14,8 @@ scaler_objs = {"StandardScaler": StandardScaler,
                "QuantileTransformer": QuantileTransformer,
                "DStandardScaler": DStandardScaler,
                "DMinMaxScaler": DMinMaxScaler,
-               "DQuantileTransformer": DQuantileTransformer}
+               "DQuantileTransformer": DQuantileTransformer,
+               "DQuantileScaler": DQuantileScaler}
 
 
 def test_scaler_io():

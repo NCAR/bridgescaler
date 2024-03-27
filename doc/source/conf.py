@@ -9,7 +9,7 @@
 project = 'bridgescaler'
 copyright = '2024, David John Gagne'
 author = 'David John Gagne'
-release = '0.5.1'
+release = '0.6.0'
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
