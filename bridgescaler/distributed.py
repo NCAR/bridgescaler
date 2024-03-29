@@ -1,8 +1,16 @@
 import numpy as np
+from numpy.lib.recfunctions import structured_to_unstructured, unstructured_to_structured
 from copy import deepcopy
+from crick import TDigest as CTDigest
+from numba_stats import norm
+import pandas as pd
+import xarray as xr
 from pytdigest import TDigest
-from scipy.stats import norm, logistic
+from functools import partial
+from scipy.stats import logistic
+from warnings import warn
 
+CENTROID_DTYPE = np.dtype([('mean', np.float64), ('weight', np.float64)])
 
 class DBaseScaler(object):
     """
@@ -87,11 +95,9 @@ class DBaseScaler(object):
 
         """
         if hasattr(x, "columns"):
-            x_packaged = deepcopy(x)
-            x_packaged.loc[:, :] = x_transformed
+            x_packaged = pd.DataFrame(x_transformed, index=x.index, columns=x.columns)
         elif hasattr(x, "coords"):
-            x_packaged = deepcopy(x)
-            x_packaged[:] = x_transformed
+            x_packaged = xr.DataArray(x_transformed, coords=x.coords, dims=x.dims, attrs=x.attrs, name=x.name)
         else:
             x_packaged = x_transformed
         return x_packaged
@@ -337,6 +343,208 @@ class DMinMaxScaler(DBaseScaler):
         return current
 
 
+def fit_variable(var_index, xv_shared=None, compression=None, channels_last=None):
+    xv = xv_shared
+    td_obj = CTDigest(compression=compression)
+    if channels_last:
+        td_obj.update(xv[..., var_index].ravel())
+    else:
+        td_obj.update(xv[:, var_index].ravel())
+    return td_obj
+
+
+def transform_variable(td_obj, xv,
+                       min_val=0.000001, max_val=0.9999999, distribution="normal"):
+    x_transformed = td_obj.cdf(xv)
+    x_transformed[:] = np.minimum(x_transformed, max_val)
+    x_transformed[:] = np.maximum(x_transformed, min_val)
+    if distribution == "normal":
+        x_transformed[:] = norm.ppf(x_transformed, loc=0, scale=1)
+    elif distribution == "logistic":
+        x_transformed[:] = logistic.ppf(x_transformed)
+    return x_transformed
+
+
+def inv_transform_variable(td_obj, xv,
+                           distribution="normal"):
+    x_transformed = np.zeros(xv.shape, dtype=xv.dtype)
+    if distribution == "normal":
+        x_transformed = norm.cdf(xv, loc=0, scale=1)
+    elif distribution == "logistic":
+        x_transformed = logistic.cdf(xv)
+    x_transformed[:] = td_obj.quantile(x_transformed)
+    return x_transformed
+
+
+class DQuantileScaler(DBaseScaler):
+    """
+    Distributed Quantile Scaler that uses the crick TDigest Cython library to compute quantiles across multiple
+    datasets in parallel. The library can perform fitting, transforms, and inverse transforms across variables
+    in parallel using the multiprocessing library. Multidimensional arrays are stored in shared memory across
+    processes to minimize inter-process communication.
+
+    Attributes:
+        compression: Recommended number of centroids to use.
+        distribution: "uniform", "normal", or "logistic".
+        min_val: Minimum value for quantile to prevent -inf results when distribution is normal or logistic.
+        max_val: Maximum value for quantile to prevent inf results when distribution is normal or logistic.
+        channels_last: Whether to assume the last dim or second dim are the channel/variable dimension.
+    """
+    def __init__(self, compression=250, distribution="uniform", min_val=0.0000001, max_val=0.9999999, channels_last=True):
+        self.compression = compression
+        self.distribution = distribution
+        self.min_val = min_val
+        self.max_val = max_val
+        self.centroids_ = None
+        self.size_ = None
+        self.min_ = None
+        self.max_ = None
+
+        super().__init__(channels_last=channels_last)
+
+    def td_objs_to_attributes(self, td_objs):
+        self.centroids_ = [structured_to_unstructured(td_obj.centroids()) for td_obj in td_objs]
+        self.size_ = np.array([td_obj.size() for td_obj in td_objs])
+        self.min_ = np.array([td_obj.min() for td_obj in td_objs])
+        self.max_ = np.array([td_obj.max() for td_obj in td_objs])
+        return
+
+    def attributes_to_td_objs(self):
+        td_objs = []
+        if self.is_fit():
+            for i in range(self.max_.size):
+                td_objs.append(CTDigest(self.compression))
+                td_objs[-1].__setstate__((unstructured_to_structured(self.centroids_[i], CENTROID_DTYPE),
+                                          self.size_[i],
+                                          self.min_[i],
+                                          self.max_[i]))
+        return td_objs
+
+    def fit(self, x, weight=None):
+        x_columns, is_array = self.extract_x_columns(x, channels_last=self.channels_last)
+        xv = self.extract_array(x)
+        channel_dim = self.set_channel_dim()
+        if not self._fit:
+            self.x_columns_ = x_columns
+            self.is_array_ = is_array
+            fit_var_func = partial(fit_variable,
+                                   xv_shared=xv,
+                                   compression=self.compression,
+                                   channels_last=self.channels_last)
+            td_objs = [fit_var_func(x) for x in np.arange(xv.shape[channel_dim])]
+            self.td_objs_to_attributes(td_objs)
+        else:
+            assert x.shape[channel_dim] == self.x_columns_.shape[0], "New data has a different number of columns"
+            if is_array:
+                x_col_order = np.arange(x.shape[-1])
+            else:
+                x_col_order = self.get_column_order(x_columns)
+            td_objs = self.attributes_to_td_objs()
+            fit_var_func = partial(fit_variable,
+                                   xv_shared=xv,
+                                   compression=self.compression,
+                                   channels_last=self.channels_last)
+            new_td_objs = [fit_var_func(x) for x in np.arange(xv.shape[channel_dim])]
+            for i, o in enumerate(x_col_order):
+                td_objs[o].merge(new_td_objs[i])
+            self.td_objs_to_attributes(td_objs)
+        self._fit = True
+        return
+
+    def transform(self, x, channels_last=None, pool=None):
+        xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
+        td_objs = self.attributes_to_td_objs()
+        td_i_objs = [(i, td_objs[o]) for i, o in enumerate(x_col_order)]
+
+        trans_var_func = partial(transform_variable,
+                                 min_val=self.min_val, max_val=self.max_val,
+                                 distribution=self.distribution)
+        if channels_last:
+            if pool is not None:
+                split_indices = np.round(np.linspace(0, xv[..., 0].size, pool._processes)).astype(int)
+                xt_shape = x_transformed[..., 0].shape
+                outputs = []
+                for td_obj in td_i_objs:
+                    for s, s_ind in enumerate(split_indices[1:]):
+                        outputs.append(pool.apply_async(trans_var_func, (td_obj[1],
+                                                        xv[..., td_obj[0]].ravel()[split_indices[s]:s_ind])))
+                    x_transformed[..., td_obj[0]] = np.reshape(np.concatenate([o.get() for o in outputs]), xt_shape)
+                    del outputs[:]
+            else:
+                for td_obj in td_i_objs:
+                    x_transformed[..., td_obj[0]] = trans_var_func(td_obj[1], xv[..., td_obj[0]])
+        else:
+            if pool is not None:
+                split_indices = np.round(np.linspace(0, xv[..., 0].size, pool._processes)).astype(int)
+                xt_shape = x_transformed[:, 0].shape
+                outputs = []
+                for td_obj in td_i_objs:
+                    for s, s_ind in enumerate(split_indices[1:]):
+                        outputs.append(pool.apply_async(trans_var_func, (td_obj[1],
+                                                        xv[..., td_obj[0]].ravel()[split_indices[s]:s_ind])))
+                    x_transformed[:, td_obj[0]] = np.reshape(np.concatenate([o.get() for o in outputs]), xt_shape)
+                    del outputs[:]
+            else:
+                for td_obj in td_i_objs:
+                    x_transformed[:, td_obj[0]] = trans_var_func(td_obj[1], xv[:, td_obj[0]])
+        x_transformed_final = self.package_transformed_x(x_transformed, x)
+        return x_transformed_final
+
+    def fit_transform(self, x, channels_last=None, weight=None, pool=None):
+        self.fit(x, weight=weight)
+        return self.transform(x, channels_last=channels_last, pool=pool)
+
+    def inverse_transform(self, x, channels_last=None, pool=None):
+        xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
+        td_objs = self.attributes_to_td_objs()
+        td_i_objs = [(i, td_objs[o]) for i, o in enumerate(x_col_order)]
+        inv_trans_var_func = partial(inv_transform_variable,
+                                 distribution=self.distribution)
+        if channels_last:
+            if pool is not None:
+                split_indices = np.round(np.linspace(0, xv[..., 0].size, pool._processes)).astype(int)
+                xt_shape = x_transformed[..., 0].shape
+                outputs = []
+                for td_obj in td_i_objs:
+                    for s, s_ind in enumerate(split_indices[1:]):
+                        outputs.append(pool.apply_async(inv_trans_var_func, (td_obj[1],
+                                                        xv[..., td_obj[0]].ravel()[split_indices[s]:s_ind])))
+                    x_transformed[..., td_obj[0]] = np.reshape(np.concatenate([o.get() for o in outputs]), xt_shape)
+                    del outputs[:]
+            else:
+                for td_obj in td_i_objs:
+                    x_transformed[..., td_obj[0]] = inv_trans_var_func(td_obj[1], xv[:, td_obj[0]])
+        else:
+            if pool is not None:
+                split_indices = np.round(np.linspace(0, xv[..., 0].size, pool._processes)).astype(int)
+                xt_shape = x_transformed[:, 0].shape
+                outputs = []
+                for td_obj in td_i_objs:
+                    for s, s_ind in enumerate(split_indices[1:]):
+                        outputs.append(pool.apply_async(inv_trans_var_func, (td_obj[1],
+                                                        xv[..., td_obj[0]].ravel()[split_indices[s]:s_ind])))
+                    x_transformed[:, td_obj[0]] = np.reshape(np.concatenate([o.get() for o in outputs]), xt_shape)
+                    del outputs[:]
+            else:
+                for td_obj in td_i_objs:
+                    x_transformed[:, td_obj[0]] = inv_trans_var_func(td_obj[1], xv[:, td_obj[0]])
+        x_transformed_final = self.package_transformed_x(x_transformed, x)
+        return x_transformed_final
+
+    def __add__(self, other):
+        current = deepcopy(self)
+        td_objs = current.attributes_to_td_objs()
+        other_td_objs = other.attributes_to_td_objs()
+        assert type(other) is DQuantileScaler, "Adding mismatched scaler types."
+        assert current.is_fit() and other.is_fit(), "At least one scaler is not fit."
+        x_col_order = current.get_column_order(other.x_columns_)
+        assert x_col_order.size > 0, "No matching columns in other DQuantileScaler"
+        for i, o in enumerate(x_col_order):
+            td_objs[o].merge(other_td_objs[i])
+        current.td_objs_to_attributes(td_objs)
+        return current
+
+
 class DQuantileTransformer(DBaseScaler):
     """
     Distributed quantile transformer that uses the T-Digest algorithm to transform the input data into approximate
@@ -354,6 +562,9 @@ class DQuantileTransformer(DBaseScaler):
             or the second dimension (False).
     """
     def __init__(self, max_merged_centroids=1000, distribution="uniform", channels_last=True):
+        warn(f'{self.__class__.__name__} will be deprecated in the next version.',
+             DeprecationWarning, stacklevel=2)
+
         self.max_merged_centroids = max_merged_centroids
         self.distribution = distribution
         self.centroids_ = None
@@ -369,7 +580,7 @@ class DQuantileTransformer(DBaseScaler):
             self.is_array_ = is_array
             # The number of centroids may vary depending on the distribution of each input variable.
             # The extra spots at the end are padded with nans.
-            self.centroids_ = np.ones((xv.shape[-1], self.max_merged_centroids, 2)) * np.nan
+            self.centroids_ = np.ones((xv.shape[channel_dim], self.max_merged_centroids, 2)) * np.nan
             if self.channels_last:
                 for i in range(xv.shape[channel_dim]):
                     td_obj = TDigest.compute(xv[..., i].ravel(), w=weight, compression=self.max_merged_centroids)
@@ -444,7 +655,7 @@ class DQuantileTransformer(DBaseScaler):
                 xd = xv[:, i].ravel().astype("float64")
                 x_transformed[:, i] = np.reshape(td_objs[o].cdf(xd), xv[:, i].shape)
         if self.distribution == "normal":
-            x_transformed = norm.ppf(x_transformed)
+            x_transformed = norm.ppf(x_transformed, loc=0, scale=1)
         elif self.distribution == "logistic":
             x_transformed = logistic.ppf(x_transformed)
         x_transformed = self.package_transformed_x(x_transformed, x)
@@ -454,7 +665,7 @@ class DQuantileTransformer(DBaseScaler):
         xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
         td_objs = self.to_digests()
         if self.distribution == "normal":
-            x_transformed = norm.cdf(xv)
+            x_transformed = norm.cdf(xv, loc=0, scale=1)
         elif self.distribution == "logistic":
             x_transformed = logistic.cdf(xv)
         if channels_last:
