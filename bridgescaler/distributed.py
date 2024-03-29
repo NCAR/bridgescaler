@@ -8,6 +8,7 @@ import xarray as xr
 from pytdigest import TDigest
 from functools import partial
 from scipy.stats import logistic
+from warnings import warn
 
 CENTROID_DTYPE = np.dtype([('mean', np.float64), ('weight', np.float64)])
 
@@ -359,6 +360,8 @@ def transform_variable(td_obj, xv,
     x_transformed[:] = np.maximum(x_transformed, min_val)
     if distribution == "normal":
         x_transformed[:] = norm.ppf(x_transformed, loc=0, scale=1)
+    elif distribution == "logistic":
+        x_transformed[:] = logistic.ppf(x_transformed)
     return x_transformed
 
 
@@ -367,6 +370,8 @@ def inv_transform_variable(td_obj, xv,
     x_transformed = np.zeros(xv.shape, dtype=xv.dtype)
     if distribution == "normal":
         x_transformed = norm.cdf(xv, loc=0, scale=1)
+    elif distribution == "logistic":
+        x_transformed = logistic.cdf(xv)
     x_transformed[:] = td_obj.quantile(x_transformed)
     return x_transformed
 
@@ -378,6 +383,12 @@ class DQuantileScaler(DBaseScaler):
     in parallel using the multiprocessing library. Multidimensional arrays are stored in shared memory across
     processes to minimize inter-process communication.
 
+    Attributes:
+        compression: Recommended number of centroids to use.
+        distribution: "uniform", "normal", or "logistic".
+        min_val: Minimum value for quantile to prevent -inf results when distribution is normal or logistic.
+        max_val: Maximum value for quantile to prevent inf results when distribution is normal or logistic.
+        channels_last: Whether to assume the last dim or second dim are the channel/variable dimension.
     """
     def __init__(self, compression=250, distribution="uniform", min_val=0.0000001, max_val=0.9999999, channels_last=True):
         self.compression = compression
@@ -551,6 +562,9 @@ class DQuantileTransformer(DBaseScaler):
             or the second dimension (False).
     """
     def __init__(self, max_merged_centroids=1000, distribution="uniform", channels_last=True):
+        warn(f'{self.__class__.__name__} will be deprecated in the next version.',
+             DeprecationWarning, stacklevel=2)
+
         self.max_merged_centroids = max_merged_centroids
         self.distribution = distribution
         self.centroids_ = None
