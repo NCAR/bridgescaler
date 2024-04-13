@@ -9,6 +9,7 @@ from pytdigest import TDigest
 from functools import partial
 from scipy.stats import logistic
 from warnings import warn
+from memory_profiler import profile
 
 CENTROID_DTYPE = np.dtype([('mean', np.float64), ('weight', np.float64)])
 
@@ -356,12 +357,12 @@ def fit_variable(var_index, xv_shared=None, compression=None, channels_last=None
 def transform_variable(td_obj, xv,
                        min_val=0.000001, max_val=0.9999999, distribution="normal"):
     x_transformed = td_obj.cdf(xv)
-    x_transformed[:] = np.minimum(x_transformed, max_val)
-    x_transformed[:] = np.maximum(x_transformed, min_val)
+    x_transformed = np.minimum(x_transformed, max_val)
+    x_transformed = np.maximum(x_transformed, min_val)
     if distribution == "normal":
-        x_transformed[:] = norm.ppf(x_transformed, loc=0, scale=1)
+        x_transformed = norm.ppf(x_transformed, loc=0, scale=1)
     elif distribution == "logistic":
-        x_transformed[:] = logistic.ppf(x_transformed)
+        x_transformed = logistic.ppf(x_transformed)
     return x_transformed
 
 
@@ -372,7 +373,7 @@ def inv_transform_variable(td_obj, xv,
         x_transformed = norm.cdf(xv, loc=0, scale=1)
     elif distribution == "logistic":
         x_transformed = logistic.cdf(xv)
-    x_transformed[:] = td_obj.quantile(x_transformed)
+    x_transformed = td_obj.quantile(x_transformed)
     return x_transformed
 
 
@@ -451,6 +452,7 @@ class DQuantileScaler(DBaseScaler):
         self._fit = True
         return
 
+    @profile
     def transform(self, x, channels_last=None, pool=None):
         xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
         td_objs = self.attributes_to_td_objs()
@@ -486,7 +488,7 @@ class DQuantileScaler(DBaseScaler):
                     del outputs[:]
             else:
                 for td_obj in td_i_objs:
-                    x_transformed[:, td_obj[0]] = trans_var_func(td_obj[1], xv[:, td_obj[0]])
+                    x_transformed[:, td_obj[0]] = trans_var_func(td_obj[1], xv[:, td_obj[0]]).copy()
         x_transformed_final = self.package_transformed_x(x_transformed, x)
         return x_transformed_final
 
