@@ -1,3 +1,5 @@
+import matplotlib
+matplotlib.use('agg')
 import numpy as np
 import matplotlib.pyplot as plt
 import psutil
@@ -15,4 +17,4 @@ mem.append(psutil.virtual_memory()[3])
 xd = xr.DataArray(data)
 mem.append(psutil.virtual_memory()[3])
 plt.plot(mem)
-plt.show()
+plt.savefig("mem_profile.png", dpi=200, bbox_inches="tight")
