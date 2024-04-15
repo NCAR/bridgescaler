@@ -10,11 +10,8 @@ from pytdigest import TDigest
 from functools import partial
 from scipy.stats import logistic
 from warnings import warn
-import psutil
-from memory_profiler import profile
+from numba import guvectorize, float32, float64, void
 CENTROID_DTYPE = np.dtype([('mean', np.float64), ('weight', np.float64)])
-import gc
-from numba import vectorize, guvectorize, float32, float64, void
 
 class DBaseScaler(object):
     """
@@ -357,27 +354,23 @@ def fit_variable(var_index, xv_shared=None, compression=None, channels_last=None
     return td_obj
 
 
-@profile
 def transform_variable(td_obj, xv,
                        min_val=0.000001, max_val=0.9999999, distribution="normal"):
-    process = psutil.Process()
+    # process = psutil.Process()
 
     # Record initial memory usage
-    stats_before = gc.get_stats()
-    #x_transformed = np.zeros(xv.shape, dtype=xv.dtype)
-    initial_memory = process.memory_info().rss
-    #x_transformed = td_obj.cdf(xv)
+    # initial_memory = process.memory_info().rss
     td_centroids = td_obj.centroids()
-    print(xv.min(), xv.max(), xv.shape)
+    # print(xv.min(), xv.max(), xv.shape)
     x_transformed = np.zeros(xv.shape, xv.dtype)
     tdigest_cdf(xv, td_centroids["mean"], td_centroids["weight"],
                                 td_obj.min(), td_obj.max(), x_transformed)
-    print(x_transformed.min(), x_transformed.max(), x_transformed.shape)
-    final_memory  = process.memory_info().rss
-    stats_after = gc.get_stats()
-    print("Memory used:", (final_memory - initial_memory) / 1e6)
-    print(stats_before)
-    print(stats_after)
+    # print(x_transformed.min(), x_transformed.max(), x_transformed.shape)
+    # final_memory  = process.memory_info().rss
+    # stats_after = gc.get_stats()
+    #print("Memory used:", (final_memory - initial_memory) / 1e6)
+    # print(stats_before)
+    # print(stats_after)
     np.minimum(x_transformed, max_val, out=x_transformed)
     np.maximum(x_transformed, min_val, out=x_transformed)
     if distribution == "normal":
