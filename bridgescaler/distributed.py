@@ -9,7 +9,7 @@ from pytdigest import TDigest
 from functools import partial
 from scipy.stats import norm, logistic
 from warnings import warn
-
+from memory_profiler import profile
 CENTROID_DTYPE = np.dtype([('mean', np.float64), ('weight', np.float64)])
 
 class DBaseScaler(object):
@@ -352,7 +352,7 @@ def fit_variable(var_index, xv_shared=None, compression=None, channels_last=None
         td_obj.update(xv[:, var_index].ravel())
     return td_obj
 
-
+@profile
 def transform_variable(td_obj, xv,
                        min_val=0.000001, max_val=0.9999999, distribution="normal"):
     x_transformed = td_obj.cdf(xv)
@@ -453,6 +453,7 @@ class DQuantileScaler(DBaseScaler):
         self._fit = True
         return
 
+    @profile
     def transform(self, x, channels_last=None, pool=None):
         xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
         td_objs = self.attributes_to_td_objs()
