@@ -101,7 +101,6 @@ def eval_dquantile_scaler(test_data):
         pool.join()
     return
 
-@profile
 def small_eval(test_data):
     process = psutil.Process()
 
