@@ -3,6 +3,7 @@ from numpy.lib.recfunctions import structured_to_unstructured, unstructured_to_s
 from copy import deepcopy
 from crick import TDigest as CTDigest
 from numba_stats import norm
+from scipy.special import ndtri
 import pandas as pd
 import xarray as xr
 from pytdigest import TDigest
@@ -13,6 +14,7 @@ import psutil
 from memory_profiler import profile
 CENTROID_DTYPE = np.dtype([('mean', np.float64), ('weight', np.float64)])
 import gc
+from numba import vectorize, guvectorize, float32, float64, void
 
 class DBaseScaler(object):
     """
@@ -354,6 +356,7 @@ def fit_variable(var_index, xv_shared=None, compression=None, channels_last=None
         td_obj.update(xv[:, var_index].ravel())
     return td_obj
 
+
 @profile
 def transform_variable(td_obj, xv,
                        min_val=0.000001, max_val=0.9999999, distribution="normal"):
@@ -363,7 +366,13 @@ def transform_variable(td_obj, xv,
     stats_before = gc.get_stats()
     #x_transformed = np.zeros(xv.shape, dtype=xv.dtype)
     initial_memory = process.memory_info().rss
-    x_transformed = td_obj.cdf(xv)
+    #x_transformed = td_obj.cdf(xv)
+    td_centroids = td_obj.centroids()
+    print(xv.min(), xv.max(), xv.shape)
+    x_transformed = np.zeros(xv.shape, xv.dtype)
+    tdigest_cdf(xv, td_centroids["mean"], td_centroids["weight"],
+                                td_obj.min(), td_obj.max(), x_transformed)
+    print(x_transformed.min(), x_transformed.max(), x_transformed.shape)
     final_memory  = process.memory_info().rss
     stats_after = gc.get_stats()
     print("Memory used:", (final_memory - initial_memory) / 1e6)
@@ -372,13 +381,62 @@ def transform_variable(td_obj, xv,
     np.minimum(x_transformed, max_val, out=x_transformed)
     np.maximum(x_transformed, min_val, out=x_transformed)
     if distribution == "normal":
-        x_transformed_final = norm.ppf(x_transformed, loc=0, scale=1)
+        x_transformed_final = ndtri(x_transformed)
     elif distribution == "logistic":
         x_transformed_final = logistic.ppf(x_transformed)
     else:
         x_transformed_final = x_transformed
     return x_transformed_final
 
+
+@guvectorize([void(float64[:], float64[:], float64[:], float64, float64, float64[:]),
+            void(float32[:], float64[:], float64[:], float64, float64, float32[:])], "(m),(n),(n),(),()->(m)")
+def tdigest_cdf(xv, centroids_mean, centroids_weight, min_val, max_val, out):
+    for i, x in enumerate(xv):
+        if centroids_mean.size == 0:
+            out[i] = np.nan
+
+        # Single centroid
+        if centroids_mean.size == 1:
+            if x < min_val:
+                out[i] = 0.0
+            elif x > max_val:
+                out[i] = 1.0
+            elif max_val - min_val < np.finfo(np.float64).eps:
+                out[i] = 0.5
+            else:
+                out[i] = (x - min_val) / (max_val - min_val)
+        # Equality checks only apply if > 1 centroid
+        if x >= max_val:
+            out[i] = 1.0
+        elif x <= min_val:
+            out[i] = 0.0
+
+        # i_l = bisect_left_mean(T->merge_centroids, x, 0, T->ncentroids);
+        i_l = np.searchsorted(centroids_mean, x, side="left")
+
+        if x < centroids_mean[0]:
+            # min < x < first centroid
+            x0 = min_val
+            x1 = centroids_mean[0]
+            dw = centroids_weight[0] / 2.0
+            out[i] =  dw * (x - x0) / (x1 - x0) / centroids_weight.sum()
+        elif i_l == centroids_mean.size:
+            # last centroid < x < max
+            x0 = centroids_mean[i_l - 1]
+            x1 = max_val
+            dw = centroids_weight[i_l - 1] / 2.0
+            out[i] = 1 - dw * (x1 - x) / (x1 - x0) / centroids_weight.sum()
+        elif centroids_mean[i_l] == x:
+            # x is equal to one or more centroids
+            i_r = np.searchsorted(centroids_mean, x, side="right")
+            out[i] = centroids_weight[i_r] / centroids_weight.sum()
+        else:
+            assert centroids_mean[i_l] > x
+            x0 = centroids_mean[i_l - 1]
+            x1 = centroids_mean[i_l]
+            dw = 0.5 * (centroids_weight[i_l - 1] + centroids_weight[i_l])
+            out[i] = (centroids_weight[i_l - 1] + dw * (x - x0) / (x1 - x0)) / centroids_weight.sum()
 
 def inv_transform_variable(td_obj, xv,
                            distribution="normal"):
@@ -466,7 +524,6 @@ class DQuantileScaler(DBaseScaler):
         self._fit = True
         return
 
-    @profile
     def transform(self, x, channels_last=None, pool=None):
         xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
         td_objs = self.attributes_to_td_objs()
