@@ -5,7 +5,10 @@ import pandas as pd
 import xarray as xr
 import os
 from multiprocessing import Pool
-from multiprocessing.pool import ThreadPool
+import psutil
+from scipy.special import ndtri
+from scipy.stats import norm
+from memory_profiler import profile
 
 def make_test_data():
     np.random.seed(34325)
@@ -13,7 +16,7 @@ def make_test_data():
     col_names = ["a", "b", "c", "d", "e"]
     test_data["means"] = np.array([0, 5.3, -2.421, 21456.3, 1.e-5])
     test_data["sds"] = np.array([5, 352.2, 1e-4, 20000.3, 5.3e-2])
-    test_data["n_examples"] = np.array([1000000, 500, 88])
+    test_data["n_examples"] = np.array([100000, 500, 88])
     test_data["numpy_2d"] = []
     test_data["numpy_4d"] = []
     test_data["pandas"] = []
@@ -98,11 +101,39 @@ def eval_dquantile_scaler(test_data):
         pool.join()
     return
 
+def small_eval(test_data):
+    process = psutil.Process()
+
+    # Record initial memory usage
+
+    test_data_c_first = test_data["xarray"][0].transpose("batch", "variable", "y", "x").astype("float32")
+    xr_dss_f = DQuantileScaler(distribution="normal", channels_last=False)
+    xr_dss_f.fit(test_data_c_first)
+    bt_memory = process.memory_info().rss
+    initial_memory = process.memory_info().rss
+    print(initial_memory/1e6)
+    xr_dss_f.distribution = None
+    test_data_c_first = xr_dss_f.transform(test_data_c_first)
+    test_data_c_sec = ndtri(test_data_c_first)
+    output_arr = np.full((1000, 50, 50), 0.5)
+    output_arr = norm.ppf(output_arr)
+    output_arr = np.full((1000, 50, 50), 0.5)
+    output_arr = ndtri(output_arr)
+    at_memory = process.memory_info().rss
+    print("final mem:", at_memory / 1e6)
+
+    print("mem diff:", (at_memory - bt_memory) / 1e6)
+    return test_data_c_first
+
+
 if __name__ == "__main__":
-    from time import perf_counter, time
+    from time import  time
 
     start = time()
     test_data = make_test_data()
-    eval_dquantile_scaler(test_data)
+    test_data_c_first = test_data["xarray"][0].transpose("batch", "variable", "y", "x").astype("float32")
+    print(test_data["xarray"][0])
+    test_data_c_first[:] = small_eval(test_data)
+    #eval_dquantile_scaler(test_data)
     stop = time()
     print(stop - start)

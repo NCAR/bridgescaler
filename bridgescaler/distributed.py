@@ -2,6 +2,7 @@ import numpy as np
 from numpy.lib.recfunctions import structured_to_unstructured, unstructured_to_structured
 from copy import deepcopy
 from crick import TDigest as CTDigest
+from scipy.special import ndtr, ndtri
 from numba_stats import norm
 import pandas as pd
 import xarray as xr
@@ -9,7 +10,7 @@ from pytdigest import TDigest
 from functools import partial
 from scipy.stats import logistic
 from warnings import warn
-
+from numba import guvectorize, float32, float64, void
 CENTROID_DTYPE = np.dtype([('mean', np.float64), ('weight', np.float64)])
 
 class DBaseScaler(object):
@@ -355,25 +356,129 @@ def fit_variable(var_index, xv_shared=None, compression=None, channels_last=None
 
 def transform_variable(td_obj, xv,
                        min_val=0.000001, max_val=0.9999999, distribution="normal"):
-    x_transformed = td_obj.cdf(xv)
-    x_transformed[:] = np.minimum(x_transformed, max_val)
-    x_transformed[:] = np.maximum(x_transformed, min_val)
+    td_centroids = td_obj.centroids()
+    x_transformed = np.zeros_like(xv)
+    tdigest_cdf(xv, td_centroids["mean"], td_centroids["weight"],
+                                td_obj.min(), td_obj.max(), x_transformed)
+    x_transformed = np.minimum(x_transformed, max_val)
+    x_transformed = np.maximum(x_transformed, min_val)
     if distribution == "normal":
-        x_transformed[:] = norm.ppf(x_transformed, loc=0, scale=1)
+        x_transformed = ndtri(x_transformed)
     elif distribution == "logistic":
-        x_transformed[:] = logistic.ppf(x_transformed)
+        x_transformed = logistic.ppf(x_transformed)
     return x_transformed
 
 
 def inv_transform_variable(td_obj, xv,
                            distribution="normal"):
-    x_transformed = np.zeros(xv.shape, dtype=xv.dtype)
+    td_centroids = td_obj.centroids()
+    x_transformed = np.zeros_like(xv)
     if distribution == "normal":
-        x_transformed = norm.cdf(xv, loc=0, scale=1)
+        x_transformed = ndtr(xv)
     elif distribution == "logistic":
         x_transformed = logistic.cdf(xv)
-    x_transformed[:] = td_obj.quantile(x_transformed)
+    tdigest_quantile(xv, td_centroids["mean"], td_centroids["weight"],
+                                td_obj.min(), td_obj.max(), x_transformed)
     return x_transformed
+
+
+@guvectorize([void(float64[:], float64[:], float64[:], float64, float64, float64[:]),
+            void(float32[:], float64[:], float64[:], float64, float64, float32[:])], "(m),(n),(n),(),()->(m)")
+def tdigest_cdf(xv, cent_mean, cent_weight, t_min, t_max, out):
+    cent_merged_weight = np.zeros_like(cent_weight)
+    cumulative_weight = 0
+    for i in range(cent_weight.size):
+        cent_merged_weight[i] = cumulative_weight + cent_weight[i] / 2.0
+        cumulative_weight += cent_weight[i]
+    total_weight = cent_weight.sum()
+    for i, x in enumerate(xv):
+        if cent_mean.size == 0:
+            out[i] = np.nan
+            continue
+        # Single centroid
+        if cent_mean.size == 1:
+            if x < t_min:
+                out[i] = 0.0
+            elif x > t_max:
+                out[i] = 1.0
+            elif t_max - t_min < np.finfo(np.float64).eps:
+                out[i] = 0.5
+            else:
+                out[i] = (x - t_min) / (t_max - t_min)
+            continue
+        # Equality checks only apply if > 1 centroid
+        if x >= t_max:
+            out[i] = 1.0
+            continue
+        elif x <= t_min:
+            out[i] = 0.0
+            continue
+
+        # i_l = bisect_left_mean(T->merge_centroids, x, 0, T->ncentroids);
+        i_l = np.searchsorted(cent_mean, x, side="left")
+        if x < cent_mean[0]:
+            # min < x < first centroid
+            x0 = t_min
+            x1 = cent_mean[0]
+            dw = cent_merged_weight[0] / 2.0
+            out[i] = dw * (x - x0) / (x1 - x0) / total_weight
+        elif i_l == cent_mean.size:
+            # last centroid < x < max
+            x0 = cent_mean[i_l - 1]
+            x1 = t_max
+            dw = cent_weight[i_l - 1] / 2.0
+            out[i] = 1.0 - dw * (x1 - x) / (x1 - x0) / total_weight
+        elif cent_mean[i_l] == x:
+            # x is equal to one or more centroids
+            i_r = np.searchsorted(cent_mean, x, side="right")
+            out[i] = cent_merged_weight[i_r] / total_weight
+        else:
+            assert cent_mean[i_l] > x
+            x0 = cent_mean[i_l - 1]
+            x1 = cent_mean[i_l]
+            dw = 0.5 * (cent_weight[i_l - 1] + cent_weight[i_l])
+            out[i] = (cent_merged_weight[i_l - 1] + dw * (x - x0) / (x1 - x0)) / total_weight
+
+
+@guvectorize([void(float64[:], float64[:], float64[:], float64, float64, float64[:]),
+            void(float32[:], float64[:], float64[:], float64, float64, float32[:])], "(m),(n),(n),(),()->(m)")
+def tdigest_quantile(qv, cent_mean, cent_weight, t_min, t_max, out):
+    cent_merged_weight = np.zeros_like(cent_weight)
+    cumulative_weight = 0
+    for i in range(cent_weight.size):
+        cent_merged_weight[i] = cumulative_weight + cent_weight[i] / 2.0
+        cumulative_weight += cent_weight[i]
+    total_weight = cent_weight.sum()
+    for i, q in enumerate(qv):
+        if total_weight == 0:
+            out[i] = np.nan
+            continue
+        if q <= 0:
+            out[i] = t_min
+            continue
+        if q >= 1:
+            out[i] = t_max
+            continue
+        if cent_mean.size == 1:
+            out[i] = cent_mean[0]
+            continue
+
+        index = q * total_weight
+        b = np.searchsorted(cent_merged_weight, index, side="left")
+        if b == 0:
+            x0 = 0
+            y0 = t_min
+        else:
+            x0 = cent_merged_weight[b - 1]
+            y0 = cent_mean[b - 1]
+
+        if b == cent_mean.size:
+            x1 = total_weight
+            y1 = t_max
+        else:
+            x1 = cent_merged_weight[b]
+            y1 = cent_mean[b]
+        out[i] = y0 + (index - x0) * (y1 - y0) / (x1 - x0)
 
 
 class DQuantileScaler(DBaseScaler):
