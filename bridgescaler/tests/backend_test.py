@@ -3,7 +3,7 @@ from bridgescaler.backend import create_synthetic_data
 import numpy as np
 import os
 from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler, QuantileTransformer
-from bridgescaler.distributed import DStandardScaler, DMinMaxScaler, DQuantileTransformer, DQuantileScaler
+from bridgescaler.distributed import DStandardScaler, DMinMaxScaler, DQuantileScaler
 from pandas import DataFrame
 from os.path import exists
 
