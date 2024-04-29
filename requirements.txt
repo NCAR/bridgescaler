@@ -4,4 +4,4 @@ scikit-learn>=1.0
 crick
 xarray
 scipy>=1.11.0
-
+numba

@@ -13,6 +13,7 @@ dependencies:
   - sphinx
   - xarray
   - crick
+  - numba
+  - sphinx-book-theme
   - pip:
-    - sphinx-book-theme
     - .
