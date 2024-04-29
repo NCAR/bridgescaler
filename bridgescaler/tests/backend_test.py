@@ -14,7 +14,6 @@ scaler_objs = {"StandardScaler": StandardScaler,
                "QuantileTransformer": QuantileTransformer,
                "DStandardScaler": DStandardScaler,
                "DMinMaxScaler": DMinMaxScaler,
-               "DQuantileTransformer": DQuantileTransformer,
                "DQuantileScaler": DQuantileScaler}
 
 
