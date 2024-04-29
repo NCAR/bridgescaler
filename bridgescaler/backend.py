@@ -2,7 +2,7 @@ from sklearn.preprocessing import (StandardScaler, MinMaxScaler, MaxAbsScaler, R
                                    SplineTransformer, PowerTransformer)
 from bridgescaler.group import GroupStandardScaler, GroupRobustScaler, GroupMinMaxScaler
 from bridgescaler.deep import DeepStandardScaler, DeepMinMaxScaler, DeepQuantileTransformer
-from bridgescaler.distributed import DStandardScaler, DMinMaxScaler, DQuantileTransformer, DQuantileScaler
+from bridgescaler.distributed import DStandardScaler, DMinMaxScaler, DQuantileScaler
 import numpy as np
 import json
 import pandas as pd
@@ -27,7 +27,7 @@ scaler_objs = {"StandardScaler": StandardScaler,
                "DStandardScaler": DStandardScaler,
                "DMinMaxScaler": DMinMaxScaler,
                "DQuantileScaler": DQuantileScaler,
-               "DQuantileTransformer": DQuantileTransformer}
+               }
 
 
 def save_scaler(scaler, scaler_file):
@@ -60,7 +60,7 @@ def print_scaler(scaler):
     return json.dumps(scaler_params, indent=4, sort_keys=True, cls=NumpyEncoder)
 
 
-def object_hook(dct: dict[Any, Any]) -> dict[Any, Any] | np.ndarray | np.generic:
+def object_hook(dct: dict[Any, Any]):
     if "__numpy__" in dct:
         np_obj = np.frombuffer(
             b64decode(dct["__numpy__"]), descr_to_dtype(dct["dtype"])
