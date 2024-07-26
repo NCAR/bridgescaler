@@ -203,7 +203,7 @@ class DStandardScaler(DBaseScaler):
                         (self.n_ + new_n) * (self.n_ + new_n - 1))
                 self.mean_x_[o] = combined_mean
                 self.var_x_[o] = weighted_var + var_correction
-                self.n_ += new_n
+            self.n_ += new_n
         self._fit = True
 
     def transform(self, x, channels_last=None):
