@@ -7,9 +7,9 @@ import pandas as pd
 import xarray as xr
 from functools import partial
 from scipy.stats import logistic
-from warnings import warn
 from numba import guvectorize, float32, float64, void
 CENTROID_DTYPE = np.dtype([('mean', np.float64), ('weight', np.float64)])
+
 
 class DBaseScaler(object):
     """
@@ -169,41 +169,56 @@ class DStandardScaler(DBaseScaler):
         if not self._fit:
             self.x_columns_ = x_columns
             self.is_array_ = is_array
-            self.n_ += xv.shape[0]
+            if len(xv.shape) > 2:
+                if self.channels_last:
+                    self.n_ += np.prod(xv.shape[:-1])
+                else:
+                    self.n_ += xv.shape[0] * np.prod(xv.shape[2:])
+            else:
+                self.n_ += xv.shape[0]
             self.mean_x_ = np.zeros(xv.shape[channel_dim], dtype=xv.dtype)
             self.var_x_ = np.zeros(xv.shape[channel_dim], dtype=xv.dtype)
             if self.channels_last:
                 for i in range(xv.shape[channel_dim]):
                     self.mean_x_[i] = np.nanmean(xv[..., i])
-                    self.var_x_[i] = np.nanvar(xv[..., i], ddof=1)
+                    self.var_x_[i] = np.nanvar(xv[..., i])
             else:
                 for i in range(xv.shape[channel_dim]):
                     self.mean_x_[i] = np.nanmean(xv[:, i])
-                    self.var_x_[i] = np.nanvar(xv[:, i], ddof=1)
+                    self.var_x_[i] = np.nanvar(xv[:, i])
 
         else:
             assert x.shape[channel_dim] == self.x_columns_.shape[0], "New data has a different number of columns"
             if is_array:
-                x_col_order = np.arange(x.shape[-1])
+                if self.channels_last:
+                    x_col_order = np.arange(x.shape[-1])
+                else:
+                    x_col_order = np.arange(x.shape[1])
             else:
                 x_col_order = self.get_column_order(x_columns)
             # update derived from
             # https://math.stackexchange.com/questions/2971315/how-do-i-combine-standard-deviations-of-two-groups
+            if len(xv.shape) > 2:
+                if self.channels_last:
+                    new_n = np.prod(xv.shape[:-1])
+                else:
+                    new_n = xv.shape[0] * np.prod(xv.shape[2:])
+            else:
+                new_n = xv.shape[0]
             for i, o in enumerate(x_col_order):
                 if self.channels_last:
                     new_mean = np.nanmean(xv[..., i])
-                    new_var = np.nanvar(xv[..., i], ddof=1)
+                    new_var = np.nanvar(xv[..., i])
                 else:
                     new_mean = np.nanmean(xv[:, i])
-                    new_var = np.nanvar(xv[:, i], ddof=1)
-                new_n = xv.shape[0]
-                combined_mean = (self.n_ * self.mean_x_[o] + x.shape[0] * new_mean) / (self.n_ + x.shape[0])
-                weighted_var = ((self.n_ - 1) * self.var_x_[o] + (new_n - 1) * new_var) / (self.n_ + new_n - 1)
-                var_correction = self.n_ * new_n * (self.mean_x_[o] - new_mean) ** 2 / (
-                        (self.n_ + new_n) * (self.n_ + new_n - 1))
+                    new_var = np.nanvar(xv[:, i])
+                combined_mean = (self.n_ * self.mean_x_[o] + new_n * new_mean) / (self.n_ + new_n)
+                weighted_var = (self.n_ * self.var_x_[o] + new_n * new_var) / (self.n_ + new_n)
+                var_correction = (self.n_ * new_n * (self.mean_x_[o] - new_mean) ** 2) / (
+                        (self.n_ + new_n) ** 2)
                 self.mean_x_[o] = combined_mean
                 self.var_x_[o] = weighted_var + var_correction
-                self.n_ += new_n
+            self.n_ += new_n
         self._fit = True
 
     def transform(self, x, channels_last=None):
@@ -250,9 +265,9 @@ class DStandardScaler(DBaseScaler):
         assert np.all(other.x_columns_ == self.x_columns_), "Scaler columns do not match."
         current = deepcopy(self)
         current.mean_x_ = (self.n_ * self.mean_x_ + other.n_ * other.mean_x_) / (self.n_ + other.n_)
-        combined_var = ((self.n_ - 1) * self.var_x_ + (other.n_ - 1) * other.var_x_) / (self.n_ + other.n_ - 1)
-        combined_var_corr = self.n_ * other.n_ * (self.mean_x_ - other.mean_x_) ** 2 / (
-                (self.n_ + other.n_) * (self.n_ + other.n_ - 1))
+        combined_var = (self.n_ * self.var_x_ + other.n_ * other.var_x_) / (self.n_ + other.n_)
+        combined_var_corr = (self.n_ * other.n_ * (self.mean_x_ - other.mean_x_) ** 2) / (
+            (self.n_ + other.n_) ** 2)
         current.var_x_ = combined_var + combined_var_corr
         current.n_ = self.n_ + other.n_
         return current
@@ -291,7 +306,10 @@ class DMinMaxScaler(DBaseScaler):
         else:
             assert x.shape[channel_dim] == self.x_columns_.shape[0], "New data has a different number of columns"
             if is_array:
-                x_col_order = np.arange(x.shape[-1])
+                if self.channels_last:
+                    x_col_order = np.arange(x.shape[-1])
+                else:
+                    x_col_order = np.arange(x.shape[1])
             else:
                 x_col_order = self.get_column_order(x_columns)
             if self.channels_last:
@@ -539,7 +557,10 @@ class DQuantileScaler(DBaseScaler):
         else:
             assert x.shape[channel_dim] == self.x_columns_.shape[0], "New data has a different number of columns"
             if is_array:
-                x_col_order = np.arange(x.shape[-1])
+                if self.channels_last:
+                    x_col_order = np.arange(x.shape[-1])
+                else:
+                    x_col_order = np.arange(x.shape[1])
             else:
                 x_col_order = self.get_column_order(x_columns)
             td_objs = self.attributes_to_td_objs()
