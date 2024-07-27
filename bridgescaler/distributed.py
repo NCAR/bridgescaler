@@ -7,7 +7,6 @@ import pandas as pd
 import xarray as xr
 from functools import partial
 from scipy.stats import logistic
-from warnings import warn
 from numba import guvectorize, float32, float64, void
 CENTROID_DTYPE = np.dtype([('mean', np.float64), ('weight', np.float64)])
 
@@ -170,7 +169,13 @@ class DStandardScaler(DBaseScaler):
         if not self._fit:
             self.x_columns_ = x_columns
             self.is_array_ = is_array
-            self.n_ += xv.shape[0]
+            if len(xv.shape) > 2:
+                if self.channels_last:
+                    self.n_ += np.prod(xv.shape[:-1])
+                else:
+                    self.n_ += xv.shape[0] * np.prod(xv.shape[2:])
+            else:
+                self.n_ += xv.shape[0]
             self.mean_x_ = np.zeros(xv.shape[channel_dim], dtype=xv.dtype)
             self.var_x_ = np.zeros(xv.shape[channel_dim], dtype=xv.dtype)
             if self.channels_last:
@@ -193,7 +198,13 @@ class DStandardScaler(DBaseScaler):
                 x_col_order = self.get_column_order(x_columns)
             # update derived from
             # https://math.stackexchange.com/questions/2971315/how-do-i-combine-standard-deviations-of-two-groups
-            new_n = xv.shape[0]
+            if len(xv.shape) > 2:
+                if self.channels_last:
+                    new_n = np.prod(xv.shape[:-1])
+                else:
+                    new_n = xv.shape[0] * np.prod(xv.shape[2:])
+            else:
+                new_n = xv.shape[0]
             for i, o in enumerate(x_col_order):
                 if self.channels_last:
                     new_mean = np.nanmean(xv[..., i])
