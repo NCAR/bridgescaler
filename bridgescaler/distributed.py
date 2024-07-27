@@ -181,11 +181,11 @@ class DStandardScaler(DBaseScaler):
             if self.channels_last:
                 for i in range(xv.shape[channel_dim]):
                     self.mean_x_[i] = np.nanmean(xv[..., i])
-                    self.var_x_[i] = np.nanvar(xv[..., i], ddof=1)
+                    self.var_x_[i] = np.nanvar(xv[..., i])
             else:
                 for i in range(xv.shape[channel_dim]):
                     self.mean_x_[i] = np.nanmean(xv[:, i])
-                    self.var_x_[i] = np.nanvar(xv[:, i], ddof=1)
+                    self.var_x_[i] = np.nanvar(xv[:, i])
 
         else:
             assert x.shape[channel_dim] == self.x_columns_.shape[0], "New data has a different number of columns"
