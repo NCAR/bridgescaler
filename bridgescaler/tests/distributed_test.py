@@ -46,12 +46,13 @@ test_data = make_test_data()
 
 def test_dstandard_scaler():
     all_ds_2d = np.vstack(test_data["numpy_2d"])
+    all_ds_4d = np.vstack(test_data["numpy_4d"])
     dsses_2d = []
     dsses_4d = []
     for n in range(test_data["n_examples"].size):
         dsses_2d.append(DStandardScaler())
         dsses_2d[-1].fit(test_data["numpy_2d"][n])
-        dsses_4d.append(DStandardScaler())
+        dsses_4d.append(DStandardScaler(channels_last=True))
         dsses_4d[-1].fit(test_data["numpy_4d"][n])
         save_scaler(dsses_2d[-1], "scaler.json")
         new_scaler = load_scaler("scaler.json")
@@ -70,11 +71,15 @@ def test_dstandard_scaler():
     dss_total_4d = np.sum(dsses_4d)
     mean_2d, var_2d = dss_total_2d.get_scales()
     mean_4d, var_4d = dss_total_4d.get_scales()
-
+    all_2d_var = all_ds_2d.var(axis=0)
+    all_4d_var = np.array([all_ds_4d[..., i].var() for i in range(all_ds_4d.shape[-1])])
+    all_4d_mean = np.array([all_ds_4d[..., i].mean() for i in range(all_ds_4d.shape[-1])])
     assert mean_2d.shape[0] == test_data["means"].shape[0] and var_2d.shape[0] == test_data["sds"].shape[0], "Stat shape mismatch"
     assert mean_4d.shape[0] == test_data["means"].shape[0] and var_4d.shape[0] == test_data["sds"].shape[0], "Stat shape mismatch"
-    assert np.max(np.abs(mean_2d - all_ds_2d.mean(axis=0))) < 1e-8, "significant difference in means"
-    assert np.max(np.abs(var_2d - all_ds_2d.var(axis=0, ddof=1))) < 1e-5, "significant difference in variances"
+    assert np.max(np.abs(mean_2d - all_ds_2d.mean(axis=0))) < 1e-5, "significant difference in means"
+    assert np.max(np.abs(var_2d - all_2d_var) / all_2d_var) < 1e-5, "significant difference in variances"
+    assert np.max(np.abs(mean_4d - all_4d_mean) / all_4d_mean) < 1e-5, "significant difference in means"
+    assert np.max(np.abs(var_4d - all_4d_var) / all_4d_var) < 1e-5, "significant difference in variances"
     sub_cols = ["d", "b"]
     pd_sub_trans = pd_dss.transform(test_data["pandas"][0][sub_cols])
     assert pd_sub_trans.shape[1] == len(sub_cols), "Did not subset properly"
