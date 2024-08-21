@@ -1,4 +1,4 @@
-from bridgescaler.distributed import DStandardScaler, DMinMaxScaler, DQuantileTransformer, DQuantileScaler
+from bridgescaler.distributed import DQuantileScaler
 from bridgescaler import save_scaler, load_scaler
 import numpy as np
 import pandas as pd
@@ -8,7 +8,6 @@ from multiprocessing import Pool
 import psutil
 from scipy.special import ndtri
 from scipy.stats import norm
-from memory_profiler import profile
 
 def make_test_data():
     np.random.seed(34325)

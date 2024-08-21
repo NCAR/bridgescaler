@@ -1,5 +1,5 @@
 from bridgescaler.distributed import DStandardScaler, DMinMaxScaler, DQuantileScaler
-from bridgescaler import save_scaler, load_scaler, print_scaler, read_scaler
+from bridgescaler import save_scaler, load_scaler
 import numpy as np
 import pandas as pd
 import xarray as xr

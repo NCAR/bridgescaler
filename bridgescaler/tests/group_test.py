@@ -2,7 +2,6 @@ from bridgescaler.group import GroupStandardScaler, GroupMinMaxScaler, GroupRobu
 from bridgescaler.backend import create_synthetic_data
 from bridgescaler import save_scaler, load_scaler
 import numpy as np
-import pandas as pd
 from os.path import exists
 import os
 
