@@ -7,9 +7,9 @@
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
 project = 'bridgescaler'
-copyright = '2024, David John Gagne'
+copyright = '2024, University Corporation for Atmopsheric Research'
 author = 'David John Gagne'
-release = '0.7.0'
+release = '0.8.0'
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
@@ -26,3 +26,4 @@ exclude_patterns = []
 
 html_theme = 'sphinx_book_theme'
 html_static_path = ['_static']
+html_logo = "_static/bridgescaler_logo.png"

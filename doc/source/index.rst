@@ -12,7 +12,6 @@ distributed scaling of data for pre-processing of AI and ML models.
    :maxdepth: 2
    :caption: Contents:
 
-   index.rst
    gettingstarted.rst
    usage.rst
    distributed.rst

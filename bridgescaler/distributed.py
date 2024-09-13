@@ -390,10 +390,12 @@ def inv_transform_variable(td_obj, xv,
     td_centroids = td_obj.centroids()
     x_transformed = np.zeros_like(xv)
     if distribution == "normal":
-        x_transformed = ndtr(xv)
+        x_intermediate = ndtr(xv)
     elif distribution == "logistic":
-        x_transformed = logistic.cdf(xv)
-    tdigest_quantile(xv, td_centroids["mean"], td_centroids["weight"],
+        x_intermediate = logistic.cdf(xv)
+    else:
+        x_intermediate = xv
+    tdigest_quantile(x_intermediate, td_centroids["mean"], td_centroids["weight"],
                                 td_obj.min(), td_obj.max(), x_transformed)
     return x_transformed
 
@@ -503,6 +505,8 @@ class DQuantileScaler(DBaseScaler):
     datasets in parallel. The library can perform fitting, transforms, and inverse transforms across variables
     in parallel using the multiprocessing library. Multidimensional arrays are stored in shared memory across
     processes to minimize inter-process communication.
+    
+    DQuantileScaler supports 
 
     Attributes:
         compression: Recommended number of centroids to use.
@@ -637,7 +641,7 @@ class DQuantileScaler(DBaseScaler):
                     del outputs[:]
             else:
                 for td_obj in td_i_objs:
-                    x_transformed[..., td_obj[0]] = inv_trans_var_func(td_obj[1], xv[:, td_obj[0]])
+                    x_transformed[..., td_obj[0]] = inv_trans_var_func(td_obj[1], xv[..., td_obj[0]])
         else:
             if pool is not None:
                 split_indices = np.round(np.linspace(0, xv[..., 0].size, pool._processes)).astype(int)
