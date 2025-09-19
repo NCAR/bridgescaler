@@ -6,7 +6,7 @@
 Bridgescaler
 ========================================
 Bridgescaler is a library to support reproducible and
-distributed scaling of data for pre-processing of AI and ML models.
+distributed scaling of data for pre-processing of machine learning model data.
 
 .. toctree::
    :maxdepth: 2
