@@ -24,7 +24,7 @@ jobs:
         shell: bash -l {0}
     steps:
       - uses: actions/checkout@v6
-            - name: Setup Python
+      - name: Setup Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
