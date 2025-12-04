@@ -4,7 +4,7 @@ import importlib.util
 from packaging import version
 import torch
 
-REQUIRED_VERSION = "2.8.0"  # required torch version
+REQUIRED_VERSION = "2.0.0"  # required torch version
 
 # Check if PyTorch is installed
 if importlib.util.find_spec("torch") is None:
@@ -13,7 +13,7 @@ if importlib.util.find_spec("torch") is None:
 installed_version = torch.__version__
 
 # Validate version
-if version.parse(installed_version) != version.parse(REQUIRED_VERSION):
+if version.parse(installed_version) < version.parse(REQUIRED_VERSION):
     raise RuntimeError(
         f"PyTorch version mismatch: required {REQUIRED_VERSION}, "
         f"found {installed_version}"
@@ -132,11 +132,11 @@ class DStandardScalerTensor(DBaseScalerTensor):
             if self.channels_last:
                 for i in range(xv.shape[channel_dim]):
                     self.mean_x_[i] = torch.mean(xv[..., i])
-                    self.var_x_[i] = torch.var(xv[..., i], unbiased=False)
+                    self.var_x_[i] = torch.var(xv[..., i], correction=0)
             else:
                 for i in range(xv.shape[channel_dim]):
                     self.mean_x_[i] = torch.mean(xv[:, i])
-                    self.var_x_[i] = torch.var(xv[:, i], unbiased=False)
+                    self.var_x_[i] = torch.var(xv[:, i], correction=0)
 
         else:
             # Update existing scaler with new data
@@ -158,10 +158,10 @@ class DStandardScalerTensor(DBaseScalerTensor):
             for i, o in enumerate(x_col_order):
                 if self.channels_last:
                     new_mean = torch.mean(xv[..., i])
-                    new_var = torch.var(xv[..., i], unbiased=False)
+                    new_var = torch.var(xv[..., i], correction=0)
                 else:
                     new_mean = torch.mean(xv[:, i])
-                    new_var = torch.var(xv[:, i], unbiased=False)
+                    new_var = torch.var(xv[:, i], correction=0)
                 combined_mean = (self.n_ * self.mean_x_[o] + new_n * new_mean) / (
                     self.n_ + new_n
                 )
