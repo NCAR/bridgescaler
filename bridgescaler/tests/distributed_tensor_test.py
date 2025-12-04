@@ -1,5 +1,5 @@
 # from bridgescaler import save_scaler, load_scaler, print_scaler, read_scaler
-from distributed_tensor import DStandardScalerTensor, DMinMaxScalerTensor
+from bridgescaler.distributed_tensor import DStandardScalerTensor, DMinMaxScalerTensor
 import numpy as np
 import torch
 import os
