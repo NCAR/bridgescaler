@@ -189,4 +189,3 @@ if __name__ == "__main__":
     scaled_data_quantile_first = xr_dss_f.transform(test_data_c_first, n_jobs=16)
     stop = perf_counter()
     print(stop - start)
-

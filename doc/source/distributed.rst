@@ -10,11 +10,6 @@ together to get representative scaling values for the full dataset. Distributed
 Standard Scalers, MinMax Scalers, and Quantile Transformers have been implemented and work with both tabular
 and muliti-dimensional patch data in numpy, pandas DataFrame, and xarray DataArray formats.
 
-The distributed scalers allow you to calculate scaling
-parameters on different subsets of a dataset and then combine the scaling factors
-together to get representative scaling values for the full dataset. Distributed
-Standard Scalers, MinMax Scalers, and Quantile Scalers have been implemented and work with both tabular
-and muliti-dimensional patch data in numpy, pandas DataFrame, and xarray DataArray formats.
 By default, the scaler assumes your channel/variable dimension is the last
 dimension, but if `channels_last=False` is set in the `__init__`, `transform`,
 or `inverse_transform` methods, then the 2nd dimension is assumed to be the variable
@@ -53,9 +48,9 @@ a pandas DataFrame for easy loading and combining later.
     import pandas as pd
     from bridgescaler import print_scaler, read_scaler
     scaler_list = [dss_1, dss_2]
-    df = pd.DataFrame({"scalers": [print_scaler(s) in scaler_list]}])
+    df = pd.DataFrame({"scalers": [print_scaler(s) for s in scaler_list]})
     df.to_parquet("scalers.parquet")
-    df_new = df.read_parquet("scalers.parquet")
+    df_new = pd.read_parquet("scalers.parquet")
     scaler_objs = df_new["scalers"].apply(read_scaler)
     total_scaler = scaler_objs.sum()
 
