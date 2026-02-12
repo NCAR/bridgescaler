@@ -22,22 +22,69 @@ class DBaseScalerTensor:
     @staticmethod
     def extract_x_columns(x, channels_last=True):
         """
-        Extract column indices to be transformed from x. All of these assume that the columns are in the last dimension.
+        Extract the variable (column) names from input x
+
+        The variable/channel names are stored as a list of strings in the
+        `variable_names` attribute. If this attribute does not exist, an error will be raised.
+        This extraction assumes that the channels are located in the last dimension.
 
         Args:
-            x (torch.tensor): tensor of values to be transformed.
+            x (torch.tensor): tensor of values.
             channels_last (bool): If True, then assume the variable or channel dimension is the last dimension of the
                 array. If False, then assume the variable or channel dimension is second.
 
         Returns:
-            x_columns (torch.tensor): tensor of column indices.
+            x_columns (torch.tensor): list of strings with variable names
         """
         var_dim_num = -1
         if not channels_last:
             var_dim_num = 1
         assert isinstance(x, torch.Tensor), "Input must be a PyTorch tensor"
-        x_columns = torch.arange(x.shape[var_dim_num], device=x.device)
+        if hasattr(x, 'variable_names'):
+            x_columns = x.variable_names
+        else:
+            x_columns = list(range(x.shape[var_dim_num]))
+        #assert getattr(x, 'variable_names', None) is not None, "variable_names attribute is missing or empty"
+        assert len(x_columns) == len(
+            set(x_columns)), f"Duplicates found! Unique count: {len(set(x_columns))}, Total count: {len(x_columns)}"
         return x_columns
+
+    @staticmethod
+    def extract_array(x):
+        pass
+
+    def get_column_order(self, x_in_columns):
+        """
+        Get the indices of the scaler columns that have the same name as the variables (columns) in the input x tensor. This
+        enables users to pass a torch.Tensor to transform or inverse_transform with fewer variables than
+        the original scaler or variables in a different order and still have the input dataset be transformed properly.
+
+        Args:
+            x_in_columns (list): list of input variable names
+
+        Returns:
+            x_in_col_indices (torch.Tensor): indices of the input variables from x in the scaler in order.
+        """
+        assert all(var in self.x_columns_ for var in x_in_columns), "Some input variables not in scaler x_columns."
+        x_in_col_indices = [self.x_columns_.index(item) for item in x_in_columns if item in self.x_columns_]
+        return x_in_col_indices
+
+    @staticmethod
+    def package_transformed_x(x_transformed, x):
+        """
+        Repackaged a transformed torch.Tensor into the same datatype as the original x, including
+        all metadata.
+
+        Args:
+            x_transformed (torch.Tensor): array after being transformed or inverse transformed
+            x (torch.Tensor)
+
+        Returns:
+
+        """
+        x_packaged = x_transformed
+        x_packaged.variable_names = x.variable_names
+        return x_packaged
 
     def set_channel_dim(self, channels_last=None):
         if channels_last is None:
@@ -53,10 +100,11 @@ class DBaseScalerTensor:
             channels_last = self.channels_last
         channel_dim = self.set_channel_dim(channels_last)
         assert self._fit, "Scaler has not been fit."
+        x_in_cols = self.extract_x_columns(x, channels_last=channels_last)
         assert (
-            x.shape[channel_dim] == self.x_columns_.shape[0]
+            x.shape[channel_dim] == len(self.x_columns_)
         ), "Number of input columns does not match scaler."
-        x_col_order = torch.arange(x.shape[channel_dim], device=x.device)
+        x_col_order = self.get_column_order(x_in_cols)
         xv = x
         x_transformed = torch.zeros(xv.shape, dtype=xv.dtype, device=xv.device)
         return xv, x_transformed, channels_last, channel_dim, x_col_order
@@ -134,12 +182,9 @@ class DStandardScalerTensor(DBaseScalerTensor):
         else:
             # Update existing scaler with new data
             assert (
-                x.shape[channel_dim] == self.x_columns_.shape[0]
+                x.shape[channel_dim] == len(self.x_columns_)
             ), "New data has a different number of columns"
-            if self.channels_last:
-                x_col_order = torch.arange(x.shape[-1], device=x.device)
-            else:
-                x_col_order = torch.arange(x.shape[1], device=x.device)
+            x_col_order = self.get_column_order(x_columns)
             if len(xv.shape) > 2:
                 if self.channels_last:
                     new_n = torch.prod(torch.tensor(xv.shape[:-1], dtype=xv.dtype, device=xv.device))
@@ -149,11 +194,11 @@ class DStandardScalerTensor(DBaseScalerTensor):
             else:
                 new_n = xv.shape[0]
             if self.channels_last:
-                new_mean = torch.mean(xv, dim=tuple(range(xv.ndim - 1)))
-                new_var = torch.var(xv, dim=tuple(range(xv.ndim - 1)), correction=0)
+                new_mean = torch.mean(xv[...,x_col_order], dim=tuple(range(xv.ndim - 1)))
+                new_var = torch.var(xv[...,x_col_order], dim=tuple(range(xv.ndim - 1)), correction=0)
             else:
-                new_mean = torch.mean(xv, dim=tuple(d for d in range(xv.ndim) if d != 1))
-                new_var = torch.var(xv, dim=tuple(d for d in range(xv.ndim) if d != 1), correction=0)
+                new_mean = torch.mean(xv[:, x_col_order], dim=tuple(d for d in range(xv.ndim) if d != 1))
+                new_var = torch.var(xv[:, x_col_order], dim=tuple(d for d in range(xv.ndim) if d != 1), correction=0)
             combined_mean = (self.n_ * self.mean_x_ + new_n * new_mean) / (
                 self.n_ + new_n
             )
@@ -188,7 +233,7 @@ class DStandardScalerTensor(DBaseScalerTensor):
             channel_dim,
             x_col_order,
         ) = self.process_x_for_transform(x, channels_last)
-        x_mean, x_var = self.get_scales()
+        x_mean, x_var = self.get_scales(x_col_order)
         if channels_last:
             x_transformed = (
                     xv - self.reshape_to_channels_last(x_mean.to(device=xv.device), xv)) / torch.sqrt(self.reshape_to_channels_last(x_var.to(device=xv.device), xv))
@@ -205,7 +250,7 @@ class DStandardScalerTensor(DBaseScalerTensor):
             channel_dim,
             x_col_order,
         ) = self.process_x_for_transform(x, channels_last)
-        x_mean, x_var = self.get_scales()
+        x_mean, x_var = self.get_scales(x_col_order)
         if channels_last:
             x_transformed = xv * \
                     torch.sqrt(self.reshape_to_channels_last(x_var.to(device=xv.device), xv)) + self.reshape_to_channels_last(x_mean.to(device=xv.device), xv)
@@ -214,15 +259,14 @@ class DStandardScalerTensor(DBaseScalerTensor):
                     torch.sqrt(self.reshape_to_channels_first(x_var.to(device=xv.device), xv)) + self.reshape_to_channels_first(x_mean.to(device=xv.device), xv)
         return x_transformed
 
-    def get_scales(self):
-        return self.mean_x_, self.var_x_
+    def get_scales(self, x_col_order):
+        return self.mean_x_[x_col_order], self.var_x_[x_col_order]
 
     def __add__(self, other):
         assert (
             type(other) is DStandardScalerTensor
         ), "Input is not DStandardScalerTensor"
-        assert torch.all(
-            other.x_columns_ == self.x_columns_
+        assert (other.x_columns_ == self.x_columns_
         ), "Scaler columns do not match."
         current = deepcopy(self)
         current.mean_x_ = (self.n_ * self.mean_x_ + other.n_ * other.mean_x_) / (
