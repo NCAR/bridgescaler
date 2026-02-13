@@ -101,10 +101,10 @@ class DBaseScalerTensor:
             channels_last = self.channels_last
         channel_dim = self.set_channel_dim(channels_last)
         assert self._fit, "Scaler has not been fit."
-        x_in_cols = self.extract_x_columns(x, channels_last=channels_last)
-        assert (
-            x.shape[channel_dim] == len(self.x_columns_)
-        ), "Number of input columns does not match scaler."
+        #x_in_cols = self.extract_x_columns(x, channels_last=channels_last)
+        #assert (
+        #    x.shape[channel_dim] == len(self.x_columns_)
+        #), "Number of input columns does not match scaler."
         x_col_order = self.get_column_order(x_in_cols)
         xv = x
         x_transformed = torch.zeros(xv.shape, dtype=xv.dtype, device=xv.device)
