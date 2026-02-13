@@ -83,7 +83,8 @@ class DBaseScalerTensor:
 
         """
         x_packaged = x_transformed
-        x_packaged.variable_names = x.variable_names
+        if getattr(x, 'variable_names', None) is not None:
+            x_packaged.variable_names = x.variable_names
         return x_packaged
 
     def set_channel_dim(self, channels_last=None):
