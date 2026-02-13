@@ -315,7 +315,7 @@ class DMinMaxScalerTensor(DBaseScalerTensor):
         else:
             # Update existing scaler with new data
             assert (
-                x.shape[channel_dim] == self.x_columns_.shape[0]
+                x.shape[channel_dim] == len(self.x_columns_)
             ), "New data has a different number of columns"
             x_col_order = self.get_column_order(x_columns)
             if self.channels_last:
