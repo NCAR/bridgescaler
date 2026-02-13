@@ -101,7 +101,7 @@ class DBaseScalerTensor:
             channels_last = self.channels_last
         channel_dim = self.set_channel_dim(channels_last)
         assert self._fit, "Scaler has not been fit."
-        #x_in_cols = self.extract_x_columns(x, channels_last=channels_last)
+        x_in_cols = self.extract_x_columns(x, channels_last=channels_last)
         #assert (
         #    x.shape[channel_dim] == len(self.x_columns_)
         #), "Number of input columns does not match scaler."
