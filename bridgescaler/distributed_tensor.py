@@ -240,7 +240,8 @@ class DStandardScalerTensor(DBaseScalerTensor):
         else:
             x_transformed = (
                     xv - self.reshape_to_channels_first(x_mean.to(device=xv.device), xv)) / torch.sqrt(self.reshape_to_channels_first(x_var.to(device=xv.device), xv))
-        return x_transformed
+        x_transformed_final = self.package_transformed_x(x_transformed, x)
+        return x_transformed_final
 
     def inverse_transform(self, x, channels_last=None):
         (
@@ -257,9 +258,10 @@ class DStandardScalerTensor(DBaseScalerTensor):
         else:
             x_transformed = xv * \
                     torch.sqrt(self.reshape_to_channels_first(x_var.to(device=xv.device), xv)) + self.reshape_to_channels_first(x_mean.to(device=xv.device), xv)
-        return x_transformed
+        x_transformed_final = self.package_transformed_x(x_transformed, x)
+        return x_transformed_final
 
-    def get_scales(self, x_col_order):
+    def get_scales(self, x_col_order=slice(None)):
         return self.mean_x_[x_col_order], self.var_x_[x_col_order]
 
     def __add__(self, other):
@@ -286,9 +288,8 @@ class DStandardScalerTensor(DBaseScalerTensor):
 class DMinMaxScalerTensor(DBaseScalerTensor):
     """
     Distributed MinMaxScaler enables calculation of min and max of variables in datasets in parallel, then combining
-    the mins and maxes as a reduction step. Scaler
-    supports torch.tensor and will return a transformed array in the
-    same form as the original with column or coordinate names preserved.
+    the mins and maxes as a reduction step. Scaler supports torch.Tensor and will return a transformed tensor in the
+    same form as the original with variable/column names preserved.
     """
 
     def __init__(self, channels_last=True):
@@ -316,10 +317,7 @@ class DMinMaxScalerTensor(DBaseScalerTensor):
             assert (
                 x.shape[channel_dim] == self.x_columns_.shape[0]
             ), "New data has a different number of columns"
-            if self.channels_last:
-                x_col_order = torch.arange(x.shape[-1], device=x.device)
-            else:
-                x_col_order = torch.arange(x.shape[1], device=x.device)
+            x_col_order = self.get_column_order(x_columns)
             if self.channels_last:
                 self.max_x_ = torch.maximum(
                     self.max_x_, torch.amax(xv, dim=tuple(range(xv.ndim - 1)))
@@ -342,7 +340,7 @@ class DMinMaxScalerTensor(DBaseScalerTensor):
             channel_dim,
             x_col_order,
         ) = self.process_x_for_transform(x, channels_last)
-        x_min, x_max = self.get_scales()
+        x_min, x_max = self.get_scales(x_col_order)
         if channels_last:
             x_transformed = (xv - self.reshape_to_channels_last(x_min.to(device=xv.device), xv)) / (
                 self.reshape_to_channels_last(x_max.to(device=xv.device), xv) - self.reshape_to_channels_last(x_min.to(device=xv.device), xv)
@@ -351,7 +349,8 @@ class DMinMaxScalerTensor(DBaseScalerTensor):
             x_transformed = (xv - self.reshape_to_channels_first(x_min.to(device=xv.device), xv)) / (
                 self.reshape_to_channels_first(x_max.to(device=xv.device), xv) - self.reshape_to_channels_first(x_min.to(device=xv.device), xv)
             )
-        return x_transformed
+        x_transformed_final = self.package_transformed_x(x_transformed, x)
+        return x_transformed_final
 
     def inverse_transform(self, x, channels_last=None):
         (
@@ -361,7 +360,7 @@ class DMinMaxScalerTensor(DBaseScalerTensor):
             channel_dim,
             x_col_order,
         ) = self.process_x_for_transform(x, channels_last)
-        x_min, x_max = self.get_scales()
+        x_min, x_max = self.get_scales(x_col_order)
         if channels_last:
             x_transformed = (
                 xv * (self.reshape_to_channels_last(x_max.to(device=xv.device), xv) - self.reshape_to_channels_last(x_min.to(device=xv.device), xv)
@@ -372,16 +371,15 @@ class DMinMaxScalerTensor(DBaseScalerTensor):
                 xv * (self.reshape_to_channels_first(x_max.to(device=xv.device), xv) - self.reshape_to_channels_first(x_min.to(device=xv.device), xv)) +
                 self.reshape_to_channels_first(x_min.to(device=xv.device), xv)
             )
-        return x_transformed
+        x_transformed_final = self.package_transformed_x(x_transformed, x)
+        return x_transformed_final
 
-    def get_scales(self):
-        return self.min_x_, self.max_x_
+    def get_scales(self, x_col_order=slice(None)):
+        return self.min_x_[x_col_order], self.max_x_[x_col_order]
 
     def __add__(self, other):
         assert type(other) is DMinMaxScalerTensor, "Input is not DMinMaxScaler"
-        assert torch.all(
-            other.x_columns_ == self.x_columns_
-        ), "Scaler columns do not match."
+        assert other.x_columns_ == self.x_columns_, "Scaler columns do not match."
         current = deepcopy(self)
         current.max_x_ = torch.maximum(self.max_x_, other.max_x_)
         current.min_x_ = torch.minimum(self.min_x_, other.min_x_)
