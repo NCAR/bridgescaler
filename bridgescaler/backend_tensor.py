@@ -36,5 +36,8 @@ def read_scaler_tensor(scaler_str):
     scaler = scaler_objs[scaler_params["type"]]()
     del scaler_params["type"]
     for k, v in scaler_params.items():
-        setattr(scaler, k, torch.tensor(v))
+        if k == "x_columns_":
+            setattr(scaler, k, v)
+        else:
+            setattr(scaler, k, torch.tensor(v))
     return scaler
