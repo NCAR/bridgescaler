@@ -1,3 +1,6 @@
+import copy
+import importlib
+
 from sklearn.preprocessing import (StandardScaler, MinMaxScaler, MaxAbsScaler, RobustScaler, QuantileTransformer,
                                    SplineTransformer, PowerTransformer)
 from bridgescaler.group import GroupStandardScaler, GroupRobustScaler, GroupMinMaxScaler
@@ -30,6 +33,16 @@ scaler_objs = {"StandardScaler": StandardScaler,
                }
 
 
+def ensure_torch():
+    """
+    Validates torch installation and load the module.
+    """
+    from . import require_torch
+    require_torch()  # enforce torch availability/version at import time
+    import torch
+    return torch
+
+
 def save_scaler(scaler, scaler_file):
     """
     Save a scikit-learn or bridgescaler scaler object to json format.
@@ -38,9 +51,18 @@ def save_scaler(scaler, scaler_file):
         scaler: scikit-learn-style scaler object
         scaler_file: path to json file where scaler information is stored.
     """
+    scaler = copy.deepcopy(scaler)
+
     scaler_params = scaler.__dict__
     scaler_params["type"] = str(type(scaler))[1:-2].split(".")[-1]
+
     with open(scaler_file, "w") as file_obj:
+        if "Tensor" in scaler_params["type"]:
+            torch = ensure_torch()
+
+            for keys in scaler_params:
+                if type(scaler_params[keys]) == torch.Tensor:
+                    scaler_params[keys] = scaler_params[keys].cpu().numpy()
         json.dump(scaler_params, file_obj, indent=4, sort_keys=True, cls=NumpyEncoder)
     return
 
@@ -55,8 +77,17 @@ def print_scaler(scaler):
     Returns:
         str representation of object in json format
     """
+    scaler = copy.deepcopy(scaler)
+
     scaler_params = scaler.__dict__
     scaler_params["type"] = str(type(scaler))[1:-2].split(".")[-1]
+
+    if "Tensor" in scaler_params["type"]:
+        torch = ensure_torch()
+
+        for keys in scaler_params:
+            if type(scaler_params[keys]) == torch.Tensor:
+                scaler_params[keys] = scaler_params[keys].cpu().numpy()
     return json.dumps(scaler_params, indent=4, sort_keys=True, cls=NumpyEncoder)
 
 
@@ -79,13 +110,36 @@ def read_scaler(scaler_str):
         scaler object.
     """
     scaler_params = json.loads(scaler_str, object_hook=object_hook)
-    scaler = scaler_objs[scaler_params["type"]]()
+
+    is_tensor = "Tensor" in scaler_params["type"]
+
+    if is_tensor:
+        torch = ensure_torch()
+
+        scaler_class = getattr(importlib.import_module("bridgescaler.distributed_tensor"), scaler_params["type"])
+        scaler = scaler_class()
+    else:
+        scaler = scaler_objs[scaler_params["type"]]()
     del scaler_params["type"]
+
     for k, v in scaler_params.items():
-        if isinstance(v, dict) and v["object"] == "ndarray":
-            setattr(scaler, k, np.array(v['data'], dtype=v['dtype']).reshape(v['shape']))
+        # 1. Handle Serialized Numpy Arrays
+        if isinstance(v, dict) and v.get("object") == "ndarray":
+            value = np.array(v['data'], dtype=v['dtype']).reshape(v['shape'])
+
+        # 2. Handle Tensors & Special Cases
+        elif is_tensor:
+            # Keep x_columns_ as-is; convert others to tensors
+            if k == "x_columns_":
+                value = v
+            else:
+                value = torch.tensor(v)
+
+        # 3. Fallback for primitives
         else:
-            setattr(scaler, k, v)
+            value = v
+
+        setattr(scaler, k, value)
     return scaler
 
 

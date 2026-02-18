@@ -35,7 +35,6 @@ if TORCH_AVAILABLE:
             DStandardScalerTensor,
             DMinMaxScalerTensor,
         )
-        from .backend_tensor import print_scaler_tensor, read_scaler_tensor
     except:
         pass
 
