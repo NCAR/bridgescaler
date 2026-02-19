@@ -1,14 +1,18 @@
+import warnings
+
 from . import require_torch
 require_torch()   # enforce torch availability/version at import time
 import torch
 
 from copy import deepcopy
 
+warnings.simplefilter("always")
+
 
 class DBaseScalerTensor:
     """
-    Base distributed scaler class for tensor. Used only to store attributes and methods shared across all distributed
-    scaler subclasses.
+    Base distributed scaler class for torch.Tensor. Used only to store attributes and methods
+    shared across all distributed scaler subclasses.
     """
 
     def __init__(self, channels_last=True):
@@ -19,35 +23,73 @@ class DBaseScalerTensor:
     def is_fit(self):
         return self._fit
 
-    @staticmethod
-    def extract_x_columns(x, channels_last=True):
+    def extract_x_columns(self, x, channels_last=True):
         """
-        Extract the variable (column) names from input x
+        Extract the variable names from input x.
 
-        The variable/channel names are stored as a list of strings in the
-        `variable_names` attribute. If this attribute does not exist, an error will be raised.
-        This extraction assumes that the channels are located in the last dimension.
+        The variable names are expected to be stored in the `variable_names`
+        attribute of the torch.Tensor. If the attribute is missing, a warning is
+        issued to notify the user that alignment validation will be limited.
 
         Args:
-            x (torch.tensor): tensor of values.
-            channels_last (bool): If True, then assume the variable or channel dimension is the last dimension of the
-                array. If False, then assume the variable or channel dimension is second.
+            x (torch.Tensor): The input tensor containing data and optionally the
+                `variable_names` attribute.
+            channels_last (bool): If True, then assume the variable or channel dimension
+                is the last dimension of the array. If False, then assume the variable or channel
+                dimension is second.
 
         Returns:
-            x_columns (torch.tensor): list of strings with variable names
+            x_columns (list[str] | list[int]): Variable names if available; otherwise,
+                integer indices generated based on the length of the variable/channel dimension.
+
+        Raises:
+            TypeError: If `x` is not a torch.Tensor or if `variable_names`
+                is not a list.
+            ValueError: If `variable_names` contains duplicate entries.
         """
-        var_dim_num = -1
-        if not channels_last:
-            var_dim_num = 1
-        assert isinstance(x, torch.Tensor), "Input must be a PyTorch tensor"
-        if hasattr(x, 'variable_names'):
-            x_columns = x.variable_names
-        else:
-            x_columns = list(range(x.shape[var_dim_num]))
-        #assert getattr(x, 'variable_names', None) is not None, "variable_names attribute is missing or empty"
-        assert len(x_columns) == len(
-            set(x_columns)), f"Duplicates found! Unique count: {len(set(x_columns))}, Total count: {len(x_columns)}"
-        return x_columns
+        if not isinstance(x, torch.Tensor):
+            raise TypeError(f"Input must be a PyTorch tensor, not {type(x).__name__}.")
+
+        # Access attribute
+        x_columns, has_attribute = getattr(x, 'variable_names', None), hasattr(x, 'variable_names')
+
+        # 1. Missing attribute
+        if x_columns is None:
+            warnings.warn(
+                f"Input data lacks variable names. When performing fit or transform, "
+                f"data/scaler consistency check is limited to variable counts; "
+                f"order cannot be validated. Ensure variable alignment to prevent incorrect results."
+            )
+            x_columns = list(range(x.shape[self.set_channel_dim(channels_last)]))
+            return x_columns, has_attribute
+
+        # 2. Attribute exists and type check
+        if not isinstance(x_columns, list):
+            raise TypeError(
+                f"Attribute variable_names must be a list, but received {type(x_columns).__name__}. "
+                f"Please provide a list of strings (e.g., ['var1', 'var2'])."
+            )
+
+        # 3. Check for data and attribute "variable_names" consistency
+        channel_dim = self.set_channel_dim()
+        data_channels = x.shape[channel_dim]
+        attribute_channels = len(x_columns)
+
+        if attribute_channels != data_channels:
+            raise ValueError(
+                f"Input data channel dimension mismatch: "
+                f"data has {data_channels} channels (dim={channel_dim}), "
+                f"but {attribute_channels} were found in attribute variable_names."
+            )
+
+        # 4. Check for duplicates
+        if len(set(x_columns)) != len(x_columns):
+            raise ValueError(
+                f"Duplicates found in variable_names! "
+                f"{len(set(x_columns))} unique vs {len(x_columns)} total."
+            )
+
+        return x_columns, has_attribute
 
     @staticmethod
     def extract_array(x):
@@ -60,12 +102,15 @@ class DBaseScalerTensor:
         the original scaler or variables in a different order and still have the input dataset be transformed properly.
 
         Args:
-            x_in_columns (list): list of input variable names
+            x_in_columns (list): list of input variable names.
 
         Returns:
-            x_in_col_indices (torch.Tensor): indices of the input variables from x in the scaler in order.
+            x_in_col_indices (list): integer indices of the input variables from x in the scaler in order.
         """
-        assert all(var in self.x_columns_ for var in x_in_columns), "Some input variables not in scaler x_columns."
+        assert all(var in self.x_columns_ for var in x_in_columns), (
+            f"Some input variables not in scaler x_columns. "
+            f"Scaler: {self.x_columns_}, input variables: {x_in_columns}"
+        )
         x_in_col_indices = [self.x_columns_.index(item) for item in x_in_columns if item in self.x_columns_]
         return x_in_col_indices
 
@@ -77,7 +122,7 @@ class DBaseScalerTensor:
 
         Args:
             x_transformed (torch.Tensor): array after being transformed or inverse transformed
-            x (torch.Tensor)
+            x (torch.Tensor): original data
 
         Returns:
 
@@ -101,10 +146,11 @@ class DBaseScalerTensor:
             channels_last = self.channels_last
         channel_dim = self.set_channel_dim(channels_last)
         assert self._fit, "Scaler has not been fit."
-        x_in_cols = self.extract_x_columns(x, channels_last=channels_last)
-        #assert (
-        #    x.shape[channel_dim] == len(self.x_columns_)
-        #), "Number of input columns does not match scaler."
+        x_in_cols, has_attribute = self.extract_x_columns(x, channels_last=channels_last)
+        if not has_attribute:
+            assert (
+                    x.shape[channel_dim] == len(self.x_columns_)
+            ), "Number of input variables does not match scaler."
         x_col_order = self.get_column_order(x_in_cols)
         xv = x
         x_transformed = torch.zeros(xv.shape, dtype=xv.dtype, device=xv.device)
@@ -147,7 +193,7 @@ class DStandardScalerTensor(DBaseScalerTensor):
     """
     Distributed version of StandardScaler. You can calculate this map-reduce style by running it on individual
     data files, returning the fitted objects, and then summing them together to represent the full dataset. Scaler
-    supports torch.tensor and returns a transformed tensor.
+    supports torch.Tensor and returns a transformed tensor.
     """
 
     def __init__(self, channels_last=True):
@@ -157,7 +203,7 @@ class DStandardScalerTensor(DBaseScalerTensor):
         super().__init__(channels_last=channels_last)
 
     def fit(self, x, weight=None):
-        x_columns = self.extract_x_columns(x, channels_last=self.channels_last)
+        x_columns, has_attribute = self.extract_x_columns(x, channels_last=self.channels_last)
         xv = x
         channel_dim = self.set_channel_dim()
         if not self._fit:
@@ -183,8 +229,8 @@ class DStandardScalerTensor(DBaseScalerTensor):
         else:
             # Update existing scaler with new data
             assert (
-                x.shape[channel_dim] == len(self.x_columns_)
-            ), "New data has a different number of columns"
+                    x.shape[channel_dim] == len(self.x_columns_)
+            ), "New data has a different number of variables."
             x_col_order = self.get_column_order(x_columns)
             if len(xv.shape) > 2:
                 if self.channels_last:
@@ -221,11 +267,11 @@ class DStandardScalerTensor(DBaseScalerTensor):
         to specify whether the new data are `channels_last` (True) or `channels_first` (False).
 
         Args:
-            x (torch.tensor): Input data.
+            x (torch.Tensor): Input data.
             channels_last: Override the default channels_last parameter of the scaler.
 
         Returns:
-            x_transformed (torch.tensor): Transformed data in the same shape and type as x.
+            x_transformed (torch.Tensor): Transformed data in the same shape and type as x.
         """
         (
             xv,
@@ -268,9 +314,10 @@ class DStandardScalerTensor(DBaseScalerTensor):
     def __add__(self, other):
         assert (
             type(other) is DStandardScalerTensor
-        ), "Input is not DStandardScalerTensor"
-        assert (other.x_columns_ == self.x_columns_
-        ), "Scaler columns do not match."
+        ), "Input is not DStandardScalerTensor."
+        assert (
+                other.x_columns_ == self.x_columns_
+        ), "Scaler variables do not match."
         current = deepcopy(self)
         current.mean_x_ = (self.n_ * self.mean_x_ + other.n_ * other.mean_x_) / (
             self.n_ + other.n_
@@ -299,7 +346,7 @@ class DMinMaxScalerTensor(DBaseScalerTensor):
         super().__init__(channels_last=channels_last)
 
     def fit(self, x, weight=None):
-        x_columns = self.extract_x_columns(x, channels_last=self.channels_last)
+        x_columns, has_attribute = self.extract_x_columns(x, channels_last=self.channels_last)
         xv = x
         channel_dim = self.set_channel_dim()
         if not self._fit:
@@ -316,8 +363,8 @@ class DMinMaxScalerTensor(DBaseScalerTensor):
         else:
             # Update existing scaler with new data
             assert (
-                x.shape[channel_dim] == len(self.x_columns_)
-            ), "New data has a different number of columns"
+                    x.shape[channel_dim] == len(self.x_columns_)
+            ), "New data has a different number of variables."
             x_col_order = self.get_column_order(x_columns)
             if self.channels_last:
                 self.max_x_ = torch.maximum(
@@ -379,8 +426,12 @@ class DMinMaxScalerTensor(DBaseScalerTensor):
         return self.min_x_[x_col_order], self.max_x_[x_col_order]
 
     def __add__(self, other):
-        assert type(other) is DMinMaxScalerTensor, "Input is not DMinMaxScaler"
-        assert other.x_columns_ == self.x_columns_, "Scaler columns do not match."
+        assert (
+            type(other) is DMinMaxScalerTensor
+        ), "Input is not DMinMaxScaler."
+        assert (
+                other.x_columns_ == self.x_columns_
+        ), "Scaler variables do not match."
         current = deepcopy(self)
         current.max_x_ = torch.maximum(self.max_x_, other.max_x_)
         current.min_x_ = torch.minimum(self.min_x_, other.min_x_)
