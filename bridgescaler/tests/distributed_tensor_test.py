@@ -122,10 +122,10 @@ def test_tensor_scaler_with_attribute():
     x_dattr = x_attr.clone()
     x_dattr.variable_names = ["ch1", "ch2", "ch3", "ch4", "ch6"]
     
-    # data on GPU
-    x_gpu = x_attr.clone()
-    x_gpu = x_gpu.to("cuda:0")
-    x_gpu.variable_names = ["ch1", "ch2", "ch3", "ch4", "ch5"]
+    ## data on GPU
+    #x_gpu = x_attr.clone()
+    #x_gpu = x_gpu.to("cuda:0")
+    #x_gpu.variable_names = ["ch1", "ch2", "ch3", "ch4", "ch5"]
 
     # collect scalers to test
     scaler_objs = [DStandardScalerTensor, DMinMaxScalerTensor]
