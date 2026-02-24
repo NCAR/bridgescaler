@@ -28,6 +28,14 @@ bridgescaler.distributed module
    :undoc-members:
    :show-inheritance:
 
+bridgescaler.distributed_tensor module
+-------------------------------
+
+.. automodule:: bridgescaler.distributed_tensor
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
 bridgescaler.group module
 -------------------------
 
