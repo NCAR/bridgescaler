@@ -1,3 +1,4 @@
+from importlib.metadata import version as get_version
 # Configuration file for the Sphinx documentation builder.
 #
 # For the full list of built-in configuration values, see the documentation:
@@ -9,12 +10,13 @@
 project = 'bridgescaler'
 copyright = '2024, University Corporation for Atmopsheric Research'
 author = 'David John Gagne'
-release = '0.8.0'
+release = get_version("bridgescaler")
+version = ".".join(release.split(".")[:3])
 
 # -- General configuration ---------------------------------------------------
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
-extensions = ['sphinx.ext.napoleon']
+extensions = ['sphinx.ext.napoleon', 'autoapi.extension', 'myst_parser']
 
 templates_path = ['_templates']
 exclude_patterns = []
@@ -26,4 +28,5 @@ exclude_patterns = []
 
 html_theme = 'sphinx_book_theme'
 html_static_path = ['_static']
+autoapi_dirs = ["../../bridgescaler",]
 html_logo = "_static/bridgescaler_logo.png"
