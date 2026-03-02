@@ -10,3 +10,4 @@ sphinx-book-theme
 setuptools_scm
 setuptools
 sphinx-autoapi
+myst_parser

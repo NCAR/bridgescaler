@@ -33,7 +33,8 @@ dependencies = [
     "sphinx-book-theme",
     "sphinx-autoapi",
     "setuptools_scm",
-    "setuptools"
+    "setuptools",
+    "myst_parser"
 ]
 requires-python = ">=3.7"
 
