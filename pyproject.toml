@@ -31,6 +31,7 @@ dependencies = [
     "numba",
     "sphinx",
     "sphinx-book-theme",
+    "sphinx-autoapi",
     "setuptools_scm",
     "setuptools"
 ]
