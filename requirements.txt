@@ -1,7 +1,11 @@
-pandas
-numpy<2.0
+pandas<3
+numpy<2.4
 scikit-learn>=1.0
 crick
 xarray
-scipy>=1.11.0
+scipy
 numba
+sphinx
+sphinx-book-theme
+setuptools_scm
+setuptools
