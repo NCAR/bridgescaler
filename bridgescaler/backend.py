@@ -63,6 +63,8 @@ def save_scaler(scaler, scaler_file):
             for keys in scaler_params:
                 if type(scaler_params[keys]) == torch.Tensor:
                     scaler_params[keys] = scaler_params[keys].cpu().numpy()
+                elif (keys == "centroids_mean_tensor") or (keys == "centroids_weight_tensor"):
+                    scaler_params[keys] = [c.cpu().numpy() for c in scaler_params[keys]]
         json.dump(scaler_params, file_obj, indent=4, sort_keys=True, cls=NumpyEncoder)
     return
 
@@ -88,6 +90,8 @@ def print_scaler(scaler):
         for keys in scaler_params:
             if type(scaler_params[keys]) == torch.Tensor:
                 scaler_params[keys] = scaler_params[keys].cpu().numpy()
+            elif (keys == "centroids_mean_tensor") or (keys == "centroids_weight_tensor"):
+                scaler_params[keys] = [c.cpu().numpy() for c in scaler_params[keys]]
     return json.dumps(scaler_params, indent=4, sort_keys=True, cls=NumpyEncoder)
 
 
@@ -129,9 +133,10 @@ def read_scaler(scaler_str):
 
         # 2. Handle Tensors & Special Cases
         elif is_tensor:
-            # Keep x_columns_ as-is; convert others to tensors
-            if k == "x_columns_":
-                value = v
+            if isinstance(v, str) or (k == "x_columns_") or (k == "centroids_"):
+                value = v # keep as it is
+            elif (k == "centroids_mean_tensor") or (k == "centroids_weight_tensor"):
+                value = [torch.tensor(c) for c in v]  # convert to a list with tensors
             else:
                 value = torch.tensor(v)
 
