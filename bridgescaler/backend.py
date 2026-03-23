@@ -137,6 +137,8 @@ def read_scaler(scaler_str):
                 value = v # keep as it is
             elif (k == "centroids_mean_tensor") or (k == "centroids_weight_tensor"):
                 value = [torch.tensor(c) for c in v]  # convert to a list with tensors
+            elif isinstance(v, np.bool_):
+                value = torch.tensor(bool(v))
             else:
                 value = torch.tensor(v)
 
