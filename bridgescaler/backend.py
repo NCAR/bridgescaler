@@ -165,6 +165,60 @@ def load_scaler(scaler_file):
     return read_scaler(scaler_str)
 
 
+def apply_to_dict_leaves(d, operation):
+    """
+    Recursively applies an operation to each leaf value in a nested dictionary.
+
+    Args:
+        d (dict): A nested dictionary where the operation will be
+            applied to each leaf value.
+        operation (callable): A function to apply to each leaf value.
+
+    Returns:
+        dict: A nested dictionary with the same structure as ``d``,
+            where each leaf is the result of ``operation(leaf)``.
+    """
+    result = {}
+    for key, value in d.items():
+        if isinstance(value, dict):
+            result[key] = apply_to_dict_leaves(value, operation)
+        else:
+            result[key] = operation(value)
+    return result
+
+
+def save_scaler_dict(scaler_dict, scaler_dict_file):
+    """
+    Serializes and saves a nested dictionary of Bridgescaler scalers to a JSON file.
+
+    Args:
+        scaler_dict (dict): A nested dictionary of fitted Bridgescaler scaler objects
+            to be saved.
+        scaler_dict_file (str or Path): The file path where the scaler
+            dictionary will be saved as a JSON file.
+    """
+    with open(scaler_dict_file, "w") as file_obj:
+        json.dump(apply_to_dict_leaves(scaler_dict, print_scaler), file_obj, indent=4, sort_keys=True, cls=NumpyEncoder)
+
+
+def load_scaler_dict(scaler_dict_file):
+    """
+    Loads and deserializes a nested dictionary of Bridgescaler scalers from a JSON file.
+
+    Args:
+        scaler_dict_file (str or Path): The file path to the JSON file
+            containing the serialized scaler dictionary.
+
+    Returns:
+        dict: A nested dictionary of reconstructed scaler objects, with the
+            same structure as the original dictionary passed to
+            ``save_scaler_dict``.
+    """
+    with open(scaler_dict_file, "r") as file_obj:
+        scaler_str = json.load(file_obj)
+    return apply_to_dict_leaves(scaler_str, read_scaler)
+
+
 class NumpyEncoder(json.JSONEncoder):
     """ Custom encoder for numpy data types """
 
