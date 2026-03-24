@@ -208,6 +208,89 @@ class NumpyEncoder(json.JSONEncoder):
         return json.JSONEncoder.default(self, obj)
 
 
+def scale_var_dict(var_dict, scalers, method, _key_path=()):
+    """
+    Recursively traverses a nested dict of tensor variables and applies a scaler method to each variable.
+
+    Args:
+        var_dict (dict): A nested dictionary where leaves are variables in torch.Tensor to be scaled.
+        scalers (object or dict): A single scaler instance (for ``fit`` and
+            ``fit_transform``) or a nested dict of scalers matching the structure
+            of ``var_dict`` (for ``transform`` and ``inverse_transform``).
+        method (str): The scaler method to apply. Must be one of ``fit``,
+            ``transform``, ``inverse_transform``, or ``fit_transform``.
+
+    Returns:
+        dict: A nested dictionary with the same structure as ``var_dict``,
+            where each leaf is either a fitted scaler (for ``fit``) or a
+            transformed variable (for ``transform``, ``inverse_transform``,
+            ``fit_transform``).
+
+    Raises:
+        AssertionError: If ``var_dict`` is not a dict.
+        AssertionError: If ``method`` is not one of the valid methods.
+        AssertionError: If ``scalers`` is not a dict when using ``transform``
+            or ``inverse_transform``.
+        AssertionError: If a key path in ``var_dict`` is missing in ``scalers``.
+        AssertionError: If a scaler at a given key path does not have the
+            requested ``method``.
+
+    Example:
+        >>> import torch
+        >>> from bridgescaler.distributed_tensor import DStandardScalerTensor
+        >>> from bridgescaler.backend import scale_var_dict
+        >>> T = torch.randn((20, 5, 4, 8))
+        >>> var_dict = {
+            "era5": {
+                "input": {"era5/prognostic/3d/T": T},
+                "target": {"era5/prognostic/3d/T": T},
+                }
+            }
+        >>> scalers = DStandardScalerTensor()
+        >>> fitted = scale_var_dict(var_dict, scalers, method="fit")
+        >>> transformed = scale_var_dict(var_dict, fitted, method="transform")
+        >>> inverse_transformed = scale_var_dict(transformed, fitted, method="inverse_transform")
+        >>> fitted_transformed = scale_var_dict(var_dict, scalers, method="fit_transformed")
+    """
+    VALID_METHODS = {"fit", "transform", "inverse_transform", "fit_transform"}
+    is_fit = "fit" in method
+
+    # Validate top-level inputs
+    assert isinstance(var_dict, dict), f"Expected 'var_dict' to be a dict, got {type(var_dict).__name__}"
+    assert method in VALID_METHODS, f"Invalid method '{method}'. Choose from {VALID_METHODS}"
+    assert isinstance(scalers, dict) or hasattr(scalers, method), (
+        f"'scalers' must be a dict or a scaler object with a '{method}' method"
+    )
+    if not is_fit:
+        assert isinstance(scalers, dict), (
+            f"For method '{method}', 'scalers' must be a dict matching the structure of 'var_dict'"
+        )
+
+    result = {}
+    for key, value in var_dict.items():
+        current_path = _key_path + (key,)
+        path_str = " -> ".join(str(k) for k in current_path)
+
+        if not is_fit:
+            assert key in scalers, (
+                f"Key path '{path_str}' found in 'var_dict' but missing in 'scalers'"
+            )
+
+        scaler = scalers if is_fit else scalers[key]
+
+        if isinstance(value, dict):
+            result[key] = scale_var_dict(value, scaler, method, current_path)
+        else:
+            assert hasattr(scaler, method), (
+                f"Scaler at key path '{path_str}' does not have a '{method}' method, got {type(scaler).__name__}"
+            )
+            result[key] = getattr(scaler, method)(value)
+            if method == "fit":
+                result[key] = scaler
+
+    return result
+
+
 def create_synthetic_data():
     locs = np.array([0, 5, -2, 350.5], dtype=np.float32)
     scales = np.array([1.0, 10, 0.1, 5000.0])
