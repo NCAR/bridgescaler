@@ -23,7 +23,7 @@ def require_torch() -> None:
         )
 
 # 2. Base Imports
-from .backend import save_scaler, load_scaler, print_scaler, read_scaler
+from .backend import save_scaler, load_scaler, print_scaler, read_scaler, save_scaler_dict, load_scaler_dict, scale_var_dict
 from .group import GroupStandardScaler, GroupRobustScaler, GroupMinMaxScaler
 from .deep import DeepStandardScaler, DeepMinMaxScaler, DeepQuantileTransformer
 from .distributed import (DStandardScaler, DMinMaxScaler, DQuantileScaler)
@@ -42,6 +42,8 @@ if TORCH_AVAILABLE:
 __all__ = [
     # Utilities
     "save_scaler", "load_scaler", "print_scaler", "read_scaler",
+    "save_scaler_dict", "load_scaler_dict",
+    "scale_var_dict",
     "TORCH_AVAILABLE",
     # Scalers
     "GroupStandardScaler", "GroupRobustScaler", "GroupMinMaxScaler",
