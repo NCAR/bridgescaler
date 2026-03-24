@@ -247,10 +247,10 @@ def scale_var_dict(var_dict, scalers, method, _key_path=()):
                 }
             }
         >>> scalers = DStandardScalerTensor()
-        >>> fitted = scale_var_dict(var_dict, scalers, method="fit")
-        >>> transformed = scale_var_dict(var_dict, fitted, method="transform")
-        >>> inverse_transformed = scale_var_dict(transformed, fitted, method="inverse_transform")
-        >>> fitted_transformed = scale_var_dict(var_dict, scalers, method="fit_transformed")
+        >>> scaler_dict = scale_var_dict(var_dict, scalers, method="fit")
+        >>> transformed = scale_var_dict(var_dict, scaler_dict, method="transform")
+        >>> inverse_transformed = scale_var_dict(transformed, scaler_dict, method="inverse_transform")
+        >>> fitted_transformed = scale_var_dict(var_dict, scalers, method="fit_transform")
     """
     VALID_METHODS = {"fit", "transform", "inverse_transform", "fit_transform"}
     is_fit = "fit" in method
