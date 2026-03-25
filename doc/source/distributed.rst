@@ -46,8 +46,14 @@ a pandas DataFrame for easy loading and combining later.
 .. code-block:: python
 
     import pandas as pd
-    from bridgescaler import print_scaler, read_scaler
+    from bridgescaler import save_scaler, print_scaler, read_scaler, load_scaler
     scaler_list = [dss_1, dss_2]
+
+    # Save and load single scalers
+    save_scaler(dss_1, "scaler.json")
+    loaded_scaler = load_scaler("scaler.json")
+
+    # Save and load multiple scalers
     df = pd.DataFrame({"scalers": [print_scaler(s) for s in scaler_list]})
     df.to_parquet("scalers.parquet")
     df_new = pd.read_parquet("scalers.parquet")

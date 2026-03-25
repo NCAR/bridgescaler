@@ -72,11 +72,11 @@ def test_deep_quantile_transformer():
     x_telephone = dqs.inverse_transform(x_transformed)
     reg_qs = QuantileTransformer(n_quantiles=1000, subsample=dim * dim * n_ex)
     def flatten_to_2D(X):
-        return np.reshape(X, newshape=(X.shape[0] * X.shape[1] * X.shape[2], X.shape[-1]))
+        return np.reshape(X, (X.shape[0] * X.shape[1] * X.shape[2], X.shape[-1]))
 
     x_flat = flatten_to_2D(x)
     x_scaled = reg_qs.fit_transform(x_flat)
-    x_tel_2 = np.reshape(reg_qs.inverse_transform(x_scaled), newshape=(x.shape[0], x.shape[1], x.shape[2], x.shape[3]))
+    x_tel_2 = np.reshape(reg_qs.inverse_transform(x_scaled), (x.shape[0], x.shape[1], x.shape[2], x.shape[3]))
     full_diff = np.abs(x - x_telephone).ravel()
     reg_diff = np.abs(x_tel_2 - x).ravel()
     assert x_transformed.shape == x.shape, "Shape mismatch"
