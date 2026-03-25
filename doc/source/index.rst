@@ -17,7 +17,8 @@ distributed scaling of data for pre-processing of AI and ML models.
    distributed.rst
    distributed_tensor.rst
    group.rst
-
+   dictionary.rst
+   modules.rst
 
 
 

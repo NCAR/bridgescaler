@@ -29,7 +29,7 @@ bridgescaler.distributed module
    :show-inheritance:
 
 bridgescaler.distributed_tensor module
--------------------------------
+--------------------------------------
 
 .. automodule:: bridgescaler.distributed_tensor
    :members:

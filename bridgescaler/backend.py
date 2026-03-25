@@ -63,6 +63,8 @@ def save_scaler(scaler, scaler_file):
             for keys in scaler_params:
                 if type(scaler_params[keys]) == torch.Tensor:
                     scaler_params[keys] = scaler_params[keys].cpu().numpy()
+                elif (keys == "centroids_mean_tensor") or (keys == "centroids_weight_tensor"):
+                    scaler_params[keys] = [c.cpu().numpy() for c in scaler_params[keys]]
         json.dump(scaler_params, file_obj, indent=4, sort_keys=True, cls=NumpyEncoder)
     return
 
@@ -88,6 +90,8 @@ def print_scaler(scaler):
         for keys in scaler_params:
             if type(scaler_params[keys]) == torch.Tensor:
                 scaler_params[keys] = scaler_params[keys].cpu().numpy()
+            elif (keys == "centroids_mean_tensor") or (keys == "centroids_weight_tensor"):
+                scaler_params[keys] = [c.cpu().numpy() for c in scaler_params[keys]]
     return json.dumps(scaler_params, indent=4, sort_keys=True, cls=NumpyEncoder)
 
 
@@ -129,9 +133,12 @@ def read_scaler(scaler_str):
 
         # 2. Handle Tensors & Special Cases
         elif is_tensor:
-            # Keep x_columns_ as-is; convert others to tensors
-            if k == "x_columns_":
-                value = v
+            if isinstance(v, str) or (k == "x_columns_") or (k == "centroids_"):
+                value = v # keep as it is
+            elif (k == "centroids_mean_tensor") or (k == "centroids_weight_tensor"):
+                value = [torch.tensor(c) for c in v]  # convert to a list with tensors
+            elif isinstance(v, np.bool_):
+                value = torch.tensor(bool(v))
             else:
                 value = torch.tensor(v)
 
@@ -156,6 +163,60 @@ def load_scaler(scaler_file):
     with open(scaler_file, "r") as file_obj:
         scaler_str = file_obj.read()
     return read_scaler(scaler_str)
+
+
+def apply_to_dict_leaves(d, operation):
+    """
+    Recursively applies an operation to each leaf value in a nested dictionary.
+
+    Args:
+        d (dict): A nested dictionary where the operation will be
+            applied to each leaf value.
+        operation (callable): A function to apply to each leaf value.
+
+    Returns:
+        dict: A nested dictionary with the same structure as ``d``,
+            where each leaf is the result of ``operation(leaf)``.
+    """
+    result = {}
+    for key, value in d.items():
+        if isinstance(value, dict):
+            result[key] = apply_to_dict_leaves(value, operation)
+        else:
+            result[key] = operation(value)
+    return result
+
+
+def save_scaler_dict(scaler_dict, scaler_dict_file):
+    """
+    Serializes and saves a nested dictionary of Bridgescaler scalers to a JSON file.
+
+    Args:
+        scaler_dict (dict): A nested dictionary of fitted Bridgescaler scaler objects
+            to be saved.
+        scaler_dict_file (str or Path): The file path where the scaler
+            dictionary will be saved as a JSON file.
+    """
+    with open(scaler_dict_file, "w") as file_obj:
+        json.dump(apply_to_dict_leaves(scaler_dict, print_scaler), file_obj, indent=4, sort_keys=True, cls=NumpyEncoder)
+
+
+def load_scaler_dict(scaler_dict_file):
+    """
+    Loads and deserializes a nested dictionary of Bridgescaler scalers from a JSON file.
+
+    Args:
+        scaler_dict_file (str or Path): The file path to the JSON file
+            containing the serialized scaler dictionary.
+
+    Returns:
+        dict: A nested dictionary of reconstructed scaler objects, with the
+            same structure as the original dictionary passed to
+            ``save_scaler_dict``.
+    """
+    with open(scaler_dict_file, "r") as file_obj:
+        scaler_str = json.load(file_obj)
+    return apply_to_dict_leaves(scaler_str, read_scaler)
 
 
 class NumpyEncoder(json.JSONEncoder):
@@ -199,6 +260,89 @@ class NumpyEncoder(json.JSONEncoder):
             return None
 
         return json.JSONEncoder.default(self, obj)
+
+
+def scale_var_dict(var_dict, scalers, method, _key_path=()):
+    """
+    Recursively traverses a nested dict of tensor variables and applies a scaler method to each variable.
+
+    Args:
+        var_dict (dict): A nested dictionary where leaves are variables in torch.Tensor to be scaled.
+        scalers (object or dict): A single scaler instance (for ``fit`` and
+            ``fit_transform``) or a nested dict of scalers matching the structure
+            of ``var_dict`` (for ``transform`` and ``inverse_transform``).
+        method (str): The scaler method to apply. Must be one of ``fit``,
+            ``transform``, ``inverse_transform``, or ``fit_transform``.
+
+    Returns:
+        dict: A nested dictionary with the same structure as ``var_dict``,
+            where each leaf is either a fitted scaler (for ``fit``) or a
+            transformed variable (for ``transform``, ``inverse_transform``,
+            ``fit_transform``).
+
+    Raises:
+        AssertionError: If ``var_dict`` is not a dict.
+        AssertionError: If ``method`` is not one of the valid methods.
+        AssertionError: If ``scalers`` is not a dict when using ``transform``
+            or ``inverse_transform``.
+        AssertionError: If a key path in ``var_dict`` is missing in ``scalers``.
+        AssertionError: If a scaler at a given key path does not have the
+            requested ``method``.
+
+    Example:
+        >>> import torch
+        >>> from bridgescaler.distributed_tensor import DStandardScalerTensor
+        >>> from bridgescaler.backend import scale_var_dict
+        >>> T = torch.randn((20, 5, 4, 8))
+        >>> var_dict = {
+            "era5": {
+                "input": {"era5/prognostic/3d/T": T},
+                "target": {"era5/prognostic/3d/T": T},
+                }
+            }
+        >>> scalers = DStandardScalerTensor()
+        >>> scaler_dict = scale_var_dict(var_dict, scalers, method="fit")
+        >>> transformed = scale_var_dict(var_dict, scaler_dict, method="transform")
+        >>> inverse_transformed = scale_var_dict(transformed, scaler_dict, method="inverse_transform")
+        >>> fitted_transformed = scale_var_dict(var_dict, scalers, method="fit_transform")
+    """
+    VALID_METHODS = {"fit", "transform", "inverse_transform", "fit_transform"}
+    is_fit = "fit" in method
+
+    # Validate top-level inputs
+    assert isinstance(var_dict, dict), f"Expected 'var_dict' to be a dict, got {type(var_dict).__name__}"
+    assert method in VALID_METHODS, f"Invalid method '{method}'. Choose from {VALID_METHODS}"
+    assert isinstance(scalers, dict) or hasattr(scalers, method), (
+        f"'scalers' must be a dict or a scaler object with a '{method}' method"
+    )
+    if not is_fit:
+        assert isinstance(scalers, dict), (
+            f"For method '{method}', 'scalers' must be a dict matching the structure of 'var_dict'"
+        )
+
+    result = {}
+    for key, value in var_dict.items():
+        current_path = _key_path + (key,)
+        path_str = " -> ".join(str(k) for k in current_path)
+
+        if not is_fit:
+            assert key in scalers, (
+                f"Key path '{path_str}' found in 'var_dict' but missing in 'scalers'"
+            )
+
+        scaler = scalers if is_fit else scalers[key]
+
+        if isinstance(value, dict):
+            result[key] = scale_var_dict(value, scaler, method, current_path)
+        else:
+            assert hasattr(scaler, method), (
+                f"Scaler at key path '{path_str}' does not have a '{method}' method, got {type(scaler).__name__}"
+            )
+            result[key] = getattr(scaler, method)(value)
+            if method == "fit":
+                result[key] = scaler
+
+    return result
 
 
 def create_synthetic_data():
