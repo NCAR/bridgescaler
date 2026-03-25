@@ -27,7 +27,7 @@ For ``"fit"`` and ``"fit_transform"``, a scaler object is required:
 .. code-block:: python
 
     from bridgescaler.distributed_tensor import DStandardScalerTensor
-    from bridgescaler import scale_var_dict, save_scaler_dict, load_scaler_dict
+    from bridgescaler import scale_var_dict
 
     scalers = DStandardScalerTensor()  # can be any scaler object
     scaler_dict = scale_var_dict(var_dict, scalers, method="fit")
