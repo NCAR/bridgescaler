@@ -262,7 +262,7 @@ class NumpyEncoder(json.JSONEncoder):
         return json.JSONEncoder.default(self, obj)
 
 
-def scale_var_dict(var_dict, scalers, method, _key_path=()):
+def scale_var_dict(var_dict, scalers, method, var_list=None, _key_path=()):
     """
     Recursively traverses a nested dict of tensor variables and applies a scaler method to each variable.
 
@@ -273,12 +273,18 @@ def scale_var_dict(var_dict, scalers, method, _key_path=()):
             of ``var_dict`` (for ``transform`` and ``inverse_transform``).
         method (str): The scaler method to apply. Must be one of ``fit``,
             ``transform``, ``inverse_transform``, or ``fit_transform``.
+        var_list (list of str, optional): A list of leaf key names to apply the
+            scaler method to. Keys not in ``var_list`` are skipped during ``fit``,
+            and left unchanged during ``transform``, ``inverse_transform``, and
+            ``fit_transform``. If ``None``, all leaf keys are processed.
 
     Returns:
         dict: A nested dictionary with the same structure as ``var_dict``,
             where each leaf is either a fitted scaler (for ``fit``) or a
             transformed variable (for ``transform``, ``inverse_transform``,
-            ``fit_transform``).
+            ``fit_transform``). Keys named ``metadata`` and keys excluded by
+            ``var_list`` are omitted for ``fit``, and passed through unchanged
+            for other methods.
 
     Raises:
         AssertionError: If ``var_dict`` is not a dict.
@@ -298,13 +304,16 @@ def scale_var_dict(var_dict, scalers, method, _key_path=()):
             "era5": {
                 "input": {"era5/prognostic/3d/T": T},
                 "target": {"era5/prognostic/3d/T": T},
+                "metadata": {"input_datetime": int, "target_datetime": int}
                 }
             }
-        >>> scalers = DStandardScalerTensor()
+        >>> scalers = DStandardScaler(channels_last=False)
         >>> scaler_dict = scale_var_dict(var_dict, scalers, method="fit")
         >>> transformed = scale_var_dict(var_dict, scaler_dict, method="transform")
         >>> inverse_transformed = scale_var_dict(transformed, scaler_dict, method="inverse_transform")
         >>> fitted_transformed = scale_var_dict(var_dict, scalers, method="fit_transform")
+        >>> # Only scale specific variables
+        >>> filtered = scale_var_dict(var_dict, scaler_dict, method="transform", var_list=["era5/prognostic/3d/T"])
     """
     VALID_METHODS = {"fit", "transform", "inverse_transform", "fit_transform"}
     is_fit = "fit" in method
@@ -325,6 +334,18 @@ def scale_var_dict(var_dict, scalers, method, _key_path=()):
         current_path = _key_path + (key,)
         path_str = " -> ".join(str(k) for k in current_path)
 
+        if key == "metadata":
+            if method != "fit":
+                result[key] = value
+            continue
+
+        is_leaf = not isinstance(value, dict)
+        is_excluded = var_list is not None and current_path[-1] not in var_list
+        if is_leaf and is_excluded:
+            if method != "fit":
+                result[key] = value
+            continue
+
         if not is_fit:
             assert key in scalers, (
                 f"Key path '{path_str}' found in 'var_dict' but missing in 'scalers'"
@@ -333,8 +354,9 @@ def scale_var_dict(var_dict, scalers, method, _key_path=()):
         scaler = scalers if is_fit else scalers[key]
 
         if isinstance(value, dict):
-            result[key] = scale_var_dict(value, scaler, method, current_path)
+            result[key] = scale_var_dict(value, scaler, method, var_list, current_path)
         else:
+            scaler = copy.deepcopy(scaler)
             assert hasattr(scaler, method), (
                 f"Scaler at key path '{path_str}' does not have a '{method}' method, got {type(scaler).__name__}"
             )
