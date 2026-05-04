@@ -12,9 +12,6 @@ license = {text = "MIT"}
 keywords = ["machine learning"]
 classifiers = [
     "Programming Language :: Python",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -23,21 +20,26 @@ classifiers = [
 ]
 dependencies = [
     "scikit-learn>=1.0",
-    "numpy<2.4",
-    "pandas<3",
+    "numpy",
+    "pandas",
     "crick",
     "scipy",
     "xarray",
     "numba",
-    "sphinx",
-    "sphinx-book-theme",
-    "sphinx-autoapi",
     "setuptools_scm",
     "setuptools",
-    "myst_parser"
 ]
-requires-python = ">=3.7"
+requires-python = ">=3.10"
 
+[project.optional-dependencies]
+develop = ["sphinx",
+           "sphinx-book-theme",
+           "sphinx-autoapi",
+           "myst_parser",
+           "ruff",
+           "pre-commit",
+           "pytest"
+]
 [project.urls]
 Homepage = "https://github.com/NCAR/bridgescaler"
 
