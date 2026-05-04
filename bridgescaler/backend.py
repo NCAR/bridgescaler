@@ -259,6 +259,9 @@ class NumpyEncoder(json.JSONEncoder):
         elif isinstance(obj, (np.void)):
             return None
 
+        elif isinstance(obj, pd.api.extensions.ExtensionArray):
+            return obj.tolist()
+
         return json.JSONEncoder.default(self, obj)
 
 
