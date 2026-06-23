@@ -1,5 +1,6 @@
 import copy
 import importlib
+import warnings
 
 from sklearn.preprocessing import (StandardScaler, MinMaxScaler, MaxAbsScaler, RobustScaler, QuantileTransformer,
                                    SplineTransformer, PowerTransformer)
@@ -321,51 +322,57 @@ def scale_var_dict(var_dict, scalers, method, var_list=None, _key_path=()):
     VALID_METHODS = {"fit", "transform", "inverse_transform", "fit_transform"}
     is_fit = "fit" in method
 
-    # Validate top-level inputs
-    assert isinstance(var_dict, dict), f"Expected 'var_dict' to be a dict, got {type(var_dict).__name__}"
-    assert method in VALID_METHODS, f"Invalid method '{method}'. Choose from {VALID_METHODS}"
-    assert isinstance(scalers, dict) or hasattr(scalers, method), (
-        f"'scalers' must be a dict or a scaler object with a '{method}' method"
-    )
-    if not is_fit:
-        assert isinstance(scalers, dict), (
-            f"For method '{method}', 'scalers' must be a dict matching the structure of 'var_dict'"
+    # Validate and convert only at the outermost call, not on every recursive level
+    if not _key_path:
+        assert isinstance(var_dict, dict), f"Expected 'var_dict' to be a dict, got {type(var_dict).__name__}"
+        assert method in VALID_METHODS, f"Invalid method '{method}'. Choose from {VALID_METHODS}"
+        assert isinstance(scalers, dict) or hasattr(scalers, method), (
+            f"'scalers' must be a dict or a scaler object with a '{method}' method"
         )
+        if not is_fit:
+            assert isinstance(scalers, dict), (
+                f"For method '{method}', 'scalers' must be a dict matching the structure of 'var_dict'"
+            )
+        if var_list is not None and not isinstance(var_list, set):
+            var_list = set(var_list)
 
     result = {}
-    for key, value in var_dict.items():
-        current_path = _key_path + (key,)
-        path_str = " -> ".join(str(k) for k in current_path)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="Input data lacks variable names")
+        for key, value in var_dict.items():
+            current_path = _key_path + (key,)
+            path_str = " -> ".join(str(k) for k in current_path)
 
-        if key == "metadata":
-            if method != "fit":
-                result[key] = value
-            continue
+            if key == "metadata":
+                if method != "fit":
+                    result[key] = value
+                continue
 
-        is_leaf = not isinstance(value, dict)
-        is_excluded = var_list is not None and current_path[-1] not in var_list
-        if is_leaf and is_excluded:
-            if method != "fit":
-                result[key] = value
-            continue
+            is_leaf = not isinstance(value, dict)
+            is_excluded = var_list is not None and current_path[-1] not in var_list
+            if is_leaf and is_excluded:
+                if method != "fit":
+                    result[key] = value
+                continue
 
-        if not is_fit:
-            assert key in scalers, (
-                f"Key path '{path_str}' found in 'var_dict' but missing in 'scalers'"
-            )
+            if not is_fit:
+                assert key in scalers, (
+                    f"Key path '{path_str}' found in 'var_dict' but missing in 'scalers'"
+                )
 
-        scaler = scalers if is_fit else scalers[key]
+            scaler = scalers if is_fit else scalers[key]
 
-        if isinstance(value, dict):
-            result[key] = scale_var_dict(value, scaler, method, var_list, current_path)
-        else:
-            scaler = copy.deepcopy(scaler)
-            assert hasattr(scaler, method), (
-                f"Scaler at key path '{path_str}' does not have a '{method}' method, got {type(scaler).__name__}"
-            )
-            result[key] = getattr(scaler, method)(value)
-            if method == "fit":
-                result[key] = scaler
+            if isinstance(value, dict):
+                result[key] = scale_var_dict(value, scaler, method, var_list, current_path)
+            else:
+                if is_fit:
+                    scaler = copy.deepcopy(scaler)
+                assert hasattr(scaler, method), (
+                    f"Scaler at key path '{path_str}' does not have a '{method}' method, got {type(scaler).__name__}"
+                )
+                result[key] = getattr(scaler, method)(value)
+                if method == "fit":
+                    result[key] = scaler
 
     return result
 

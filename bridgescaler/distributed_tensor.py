@@ -458,10 +458,7 @@ def fit_variable_tensor(var_index, xv, compression=None, channels_last=None):
 def transform_variable_tensor(cent_mean, cent_weight, t_min, t_max, xv,
                        min_val=0.000001, max_val=0.9999999, distribution="normal"):
     x_transformed = tdigest_cdf_tensor(xv, cent_mean, cent_weight, t_min, t_max)
-    x_transformed = torch.minimum(x_transformed, torch.tensor(max_val, dtype=x_transformed.dtype,
-                                                              device=x_transformed.device))
-    x_transformed = torch.maximum(x_transformed, torch.tensor(min_val, dtype=x_transformed.dtype,
-                                                              device=x_transformed.device))
+    x_transformed = torch.clamp(x_transformed, min=min_val, max=max_val)
     if distribution == "normal":
         x_transformed = torch.special.ndtri(x_transformed)
     elif distribution == "logistic":
