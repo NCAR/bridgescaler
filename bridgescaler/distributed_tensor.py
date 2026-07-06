@@ -546,8 +546,10 @@ def tdigest_cdf_tensor(xv, cent_mean, cent_weight, t_min, t_max, n_real):
     i_r_c = torch.minimum(i_r, nlast)
 
     first_mean = cent_mean[0]
-    last_mean = cent_mean[nlast]
-    last_w = cent_weight[nlast]
+    # index with a 1-d index via index_select rather than cent_mean[nlast]: indexing by a 0-d tensor
+    # calls .item() internally, which torch.vmap forbids on older torch versions.
+    last_mean = cent_mean.index_select(0, nlast.reshape(1)).squeeze(0)
+    last_w = cent_weight.index_select(0, nlast.reshape(1)).squeeze(0)
 
     # --- case m1: t_min < x < first centroid ---
     dw1 = cent_merged_weight[0] / 2.0
