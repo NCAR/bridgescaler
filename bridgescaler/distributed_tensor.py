@@ -4,6 +4,7 @@ from . import require_torch
 require_torch()   # enforce torch availability/version at import time
 import torch
 
+import weakref
 from copy import deepcopy
 from functools import partial
 
@@ -13,6 +14,34 @@ from numpy.lib.recfunctions import structured_to_unstructured, unstructured_to_s
 CENTROID_DTYPE = np.dtype([('mean', np.float64), ('weight', np.float64)])
 
 warnings.simplefilter("always")
+
+# Cache of vmapped (and optionally torch.compiled) transform functions, keyed weakly by scaler instance so
+# nothing non-serializable is stored on the scaler's __dict__ and entries are dropped when the scaler is freed.
+_BATCHED_CACHE = weakref.WeakKeyDictionary()
+
+
+def _bucketize(sorted_seq, values, side):
+    """Return insertion indices of ``values`` into the ascending 1-D ``sorted_seq`` (like ``torch.searchsorted``).
+
+    ``torch.searchsorted`` has a pathologically slow Metal kernel, so on MPS the indices are computed with a
+    broadcast reduction instead (O(N*K) memory, but roughly an order of magnitude faster there). On CPU/CUDA the
+    binary-search ``torch.searchsorted`` is used, which is far faster and memory-light where it is well
+    implemented. The device check is a static branch, so it does not break the graph under ``torch.compile``.
+
+    Args:
+        sorted_seq (torch.Tensor): ascending boundaries, shape ``(K,)`` (per variable under vmap).
+        values (torch.Tensor): values to locate, any shape.
+        side (str): ``"left"`` (count of boundaries strictly less than each value) or ``"right"`` (count of
+            boundaries less than or equal to each value), matching ``torch.searchsorted`` semantics.
+
+    Returns:
+        torch.Tensor: int64 indices with the same shape as ``values``.
+    """
+    if values.device.type == "mps":
+        if side == "left":
+            return torch.sum(sorted_seq < values.unsqueeze(-1), dim=-1)
+        return torch.sum(sorted_seq <= values.unsqueeze(-1), dim=-1)
+    return torch.searchsorted(sorted_seq, values, side=side)
 
 
 class DBaseScalerTensor:
@@ -455,9 +484,14 @@ def fit_variable_tensor(var_index, xv, compression=None, channels_last=None):
     return td_obj
 
 
-def transform_variable_tensor(cent_mean, cent_weight, t_min, t_max, xv,
+def transform_variable_tensor(cent_mean, cent_weight, t_min, t_max, n_real, xv,
                        min_val=0.000001, max_val=0.9999999, distribution="normal"):
-    x_transformed = tdigest_cdf_tensor(xv, cent_mean, cent_weight, t_min, t_max)
+    """Per-variable forward quantile transform, written branchlessly so it can be wrapped in ``torch.vmap``.
+
+    ``cent_mean``/``cent_weight`` are the padded ``(K,)`` centroid tensors for a single variable (padding means
+    are ``+inf`` and padding weights are ``0``); ``n_real`` is the number of valid (non-padding) centroids.
+    """
+    x_transformed = tdigest_cdf_tensor(xv, cent_mean, cent_weight, t_min, t_max, n_real)
     x_transformed = torch.clamp(x_transformed, min=min_val, max=max_val)
     if distribution == "normal":
         x_transformed = torch.special.ndtri(x_transformed)
@@ -466,144 +500,148 @@ def transform_variable_tensor(cent_mean, cent_weight, t_min, t_max, xv,
     return x_transformed
 
 
-def inv_transform_variable_tensor(cent_mean, cent_weight, t_min, t_max, xv,
+def inv_transform_variable_tensor(cent_mean, cent_weight, t_min, t_max, n_real, xv,
                                   distribution="normal"):
+    """Per-variable inverse quantile transform, branchless for ``torch.vmap``. See ``transform_variable_tensor``."""
     if distribution == "normal":
         x_intermediate = torch.special.ndtr(xv)
     elif distribution == "logistic":
         x_intermediate = torch.sigmoid(xv)
     else:
         x_intermediate = xv
-    x_transformed = tdigest_quantile_tensor(x_intermediate, cent_mean, cent_weight, t_min, t_max)
+    x_transformed = tdigest_quantile_tensor(x_intermediate, cent_mean, cent_weight, t_min, t_max, n_real)
     return x_transformed
 
 
-def tdigest_cdf_tensor(xv, cent_mean, cent_weight, t_min, t_max):
-    num_centroids = cent_mean.numel()
+def tdigest_cdf_tensor(xv, cent_mean, cent_weight, t_min, t_max, n_real):
+    """Evaluate the TDigest CDF at every element of ``xv`` for a single variable.
 
+    This is a branchless, fixed-shape reformulation of the original masked implementation so that it composes
+    with ``torch.vmap`` over the channel dimension. All four interpolation cases are computed everywhere and
+    selected with ``torch.where`` rather than boolean-mask assignment, and centroid arrays are padded to a
+    common length ``K`` (``+inf`` means, ``0`` weights) so that ``n_real`` (not ``K``) delimits the real
+    centroids.
+
+    Args:
+        xv (torch.Tensor): values to evaluate, any shape.
+        cent_mean (torch.Tensor): padded ``(K,)`` centroid means, ascending, padding = ``+inf``.
+        cent_weight (torch.Tensor): padded ``(K,)`` centroid weights, padding = ``0``.
+        t_min, t_max: scalar min/max of the digest.
+        n_real: number of valid centroids (0-d integer tensor works under vmap).
+
+    Returns:
+        torch.Tensor: CDF values in ``[0, 1]`` with the same shape as ``xv``.
+    """
+    K = cent_mean.numel()
     cum_sum = torch.cumsum(cent_weight, dim=0)
     cent_merged_weight = cum_sum - (cent_weight / 2.0)
     total_weight = cent_weight.sum()
+    eps = torch.finfo(xv.dtype).eps
 
-    out = torch.full(xv.shape, torch.nan, dtype=xv.dtype, device=xv.device)
+    # index of the last real centroid, and clamped search indices that never reach the padding region
+    nlast = torch.clamp(n_real - 1, min=0)
+    i_l = _bucketize(cent_mean, xv, "left")   # in [0, K]
+    i_r = _bucketize(cent_mean, xv, "right")  # in [0, K]
+    i_l_c = torch.minimum(i_l, nlast)
+    i_r_c = torch.minimum(i_r, nlast)
 
-    if num_centroids == 0:
-        return out
+    first_mean = cent_mean[0]
+    last_mean = cent_mean[nlast]
+    last_w = cent_weight[nlast]
 
-    # Single centroid
-    if num_centroids == 1:
-        out = torch.where(xv < t_min, 0.0, out)
-        out = torch.where(xv > t_max, 1.0, out)
+    # --- case m1: t_min < x < first centroid ---
+    dw1 = cent_merged_weight[0] / 2.0
+    denom1 = first_mean - t_min
+    res_m1 = dw1 * (xv - t_min) / torch.where(denom1 == 0, 1.0, denom1) / total_weight
 
-        mask = (xv >= t_min) & (xv <= t_max)
-        eps = torch.finfo(xv.dtype).eps # find the Machine Epsilon
-        if t_max - t_min < eps: # smaller than the smallest measurable gap
-            out[mask] = 0.5
-        else:
-            out[mask] = (xv[mask] - t_min) / (t_max - t_min)
-        return out
+    # --- case m2: last centroid < x < t_max ---
+    dw2 = last_w / 2.0
+    denom2 = t_max - last_mean
+    res_m2 = 1.0 - dw2 * (t_max - xv) / torch.where(denom2 == 0, 1.0, denom2) / total_weight
 
-    # Multi-centroid
-    # clamping extremes
-    out = torch.where(xv >= t_max, 1.0, out)
-    out = torch.where(xv <= t_min, 0.0, out)
+    # --- case m3: x equals a centroid mean ---
+    res_m3 = cent_merged_weight[i_r_c] / total_weight
 
-    # identify indices that still need processing
-    active_mask = torch.isnan(out)
-    if not active_mask.any():
-        return out
+    # --- case m4: x strictly between two centroids ---
+    # keep idx_l in [1, K-1] so the (discarded) result never indexes out of bounds when K == 1
+    idx_l = torch.minimum(torch.clamp(i_l, min=1), torch.clamp(nlast, min=1)).clamp(max=max(K - 1, 0))
+    x0 = cent_mean[idx_l - 1]
+    x1 = cent_mean[idx_l]
+    dw4 = 0.5 * (cent_weight[idx_l - 1] + cent_weight[idx_l])
+    denom4 = x1 - x0
+    res_m4 = (cent_merged_weight[idx_l - 1] + dw4 * (xv - x0) / torch.where(denom4 == 0, 1.0, denom4)) / total_weight
 
-    x_active = xv[active_mask]
+    # select case by priority m1 > m2 > m3 > m4
+    m1 = xv < first_mean
+    m2 = (~m1) & (i_l >= n_real)
+    m3 = (~m1) & (~m2) & (cent_mean[i_l_c] == xv)
+    res_multi = torch.where(m1, res_m1,
+                torch.where(m2, res_m2,
+                torch.where(m3, res_m3, res_m4)))
+    # multi-centroid extremes
+    res_multi = torch.where(xv >= t_max, torch.ones_like(res_multi),
+                torch.where(xv <= t_min, torch.zeros_like(res_multi), res_multi))
 
-    # binary Search
-    # i_l is the index where x_active would be inserted to maintain order, "cent_mean" is a sorted tensor
-    i_l = torch.searchsorted(cent_mean, x_active, side="left") # (default): $S[i-1] < v \le S[i]$
+    # single-centroid: linear ramp between t_min and t_max (0.5 for a degenerate range)
+    rng = t_max - t_min
+    res_single = torch.where(xv < t_min, torch.zeros_like(xv),
+                 torch.where(xv > t_max, torch.ones_like(xv),
+                 torch.where(rng < eps, torch.full_like(xv, 0.5),
+                             (xv - t_min) / torch.where(rng == 0, 1.0, rng))))
 
-    # initialize results for active elements
-    res = torch.zeros_like(x_active)
-
-    # --- min < x < first centroid ---
-    m1 = x_active < cent_mean[0]
-    if m1.any():
-        x0, x1 = t_min, cent_mean[0]
-        dw = cent_merged_weight[0] / 2.0
-        res[m1] = dw * (x_active[m1] - x0) / (x1 - x0) / total_weight
-
-    # --- last centroid < x < max ---
-    m2 = (~m1) & (i_l == num_centroids)
-    if m2.any():
-        idx_last = num_centroids - 1
-        x0, x1 = cent_mean[idx_last], t_max
-        dw = cent_weight[idx_last] / 2.0
-        res[m2] = 1.0 - dw * (x1 - x_active[m2]) / (x1 - x0) / total_weight
-
-    # --- x is equal to one or more centroids ---
-    m3 = (~m1) & (~m2) & (cent_mean[i_l.clamp(max=num_centroids - 1)] == x_active)
-    if m3.any():
-        # side='right' finds the upper bound of the equality range
-        i_r = torch.searchsorted(cent_mean, x_active, side="right")
-        res[m3] = cent_merged_weight[i_r[m3]] / total_weight
-
-    # --- x between two centroids ---
-    m4 = (~m1) & (~m2) & (~m3)
-    if m4.any():
-        idx_l = i_l[m4]
-        x0 = cent_mean[idx_l - 1]
-        x1 = cent_mean[idx_l]
-        dw = 0.5 * (cent_weight[idx_l - 1] + cent_weight[idx_l])
-        interpolated = cent_merged_weight[idx_l - 1] + dw * (x_active[m4] - x0) / (x1 - x0)
-        res[m4] = interpolated / total_weight
-
-    out[active_mask] = res
+    out = torch.where(n_real <= 1, res_single, res_multi)
+    # empty digest -> nan, matching the original behavior
+    out = torch.where(n_real == 0, torch.full_like(out, float("nan")), out)
     return out
 
 
-def tdigest_quantile_tensor(qv, cent_mean, cent_weight, t_min, t_max):
-    num_centroids = cent_mean.numel()
+def tdigest_quantile_tensor(qv, cent_mean, cent_weight, t_min, t_max, n_real):
+    """Evaluate the TDigest inverse CDF (quantile function) at every element of ``qv`` for a single variable.
 
+    Branchless, fixed-shape reformulation of the original masked implementation for ``torch.vmap``
+    compatibility. See ``tdigest_cdf_tensor`` for the padding/``n_real`` convention.
+
+    Args:
+        qv (torch.Tensor): quantiles in ``[0, 1]``, any shape.
+        cent_mean (torch.Tensor): padded ``(K,)`` centroid means, ascending, padding = ``+inf``.
+        cent_weight (torch.Tensor): padded ``(K,)`` centroid weights, padding = ``0``.
+        t_min, t_max: scalar min/max of the digest.
+        n_real: number of valid centroids.
+
+    Returns:
+        torch.Tensor: interpolated values with the same shape as ``qv``.
+    """
+    K = cent_mean.numel()
     cum_sum = torch.cumsum(cent_weight, dim=0)
     cent_merged_weight = cum_sum - (cent_weight / 2.0)
     total_weight = cent_weight.sum()
+    nlast = torch.clamp(n_real - 1, min=0)
 
-    out = torch.full(qv.shape, torch.nan, dtype=qv.dtype, device=qv.device)
-
-    if total_weight == 0:
-        return out
-
-    out = torch.where(qv <= 0, t_min, out)
-    out = torch.where(qv >= 1, t_max, out)
-
-    if num_centroids == 1:
-        mask = (qv > 0) & (qv < 1)
-        out[mask] = cent_mean[0]  # valid ones return the "mean"
-        return out
-
-    # identify indices that still need processing
-    active_mask = torch.isnan(out)
-    if not active_mask.any():
-        return out
-
-    q_active = qv[active_mask]
-    target_weight = q_active * total_weight
-
-    idx_r = torch.searchsorted(cent_merged_weight, target_weight, side="left")
+    target_weight = qv * total_weight
+    # padding merged-weights equal total_weight, so idx_r lands at n_real once past the last real centroid
+    idx_r = _bucketize(cent_merged_weight, target_weight, "left")  # in [0, K]
     idx_l = idx_r - 1
+    at_end = idx_r >= n_real
+    idx_r_c = torch.minimum(idx_r, nlast)
+    idx_l_c = torch.clamp(idx_l, min=0)
 
-    # --- define x0, y0 (Left boundary of interpolation) ---
-    # If idx_r is 0, we interpolate from (0, t_min)
-    x0 = torch.where(idx_r == 0, 0.0, cent_merged_weight[idx_l.clamp(min=0)])
-    y0 = torch.where(idx_r == 0, t_min, cent_mean[idx_l.clamp(min=0)])
+    # left boundary: (0, t_min) when idx_r == 0, else the merged-weight/mean of the left centroid
+    x0 = torch.where(idx_r == 0, torch.zeros_like(target_weight), cent_merged_weight[idx_l_c])
+    y0 = torch.where(idx_r == 0, t_min + torch.zeros_like(target_weight), cent_mean[idx_l_c])
+    # right boundary: (total_weight, t_max) past the last centroid, else the merged-weight/mean of the right centroid
+    x1 = torch.where(at_end, total_weight + torch.zeros_like(target_weight), cent_merged_weight[idx_r_c])
+    y1 = torch.where(at_end, t_max + torch.zeros_like(target_weight), cent_mean[idx_r_c])
 
-    # --- define x1, y1 (right boundary of interpolation) ---
-    at_end = (idx_r == num_centroids)
-    x1 = torch.where(at_end, total_weight, cent_merged_weight[idx_r.clamp(max=num_centroids-1)])
-    y1 = torch.where(at_end, t_max, cent_mean[idx_r.clamp(max=num_centroids-1)])
-
-    # --- linear interpolation formula: y = y0 + (x - x0) * (y1 - y0) / (x1 - x0) ---
     denom = x1 - x0
     res = y0 + (target_weight - x0) * (y1 - y0) / torch.where(denom == 0, 1e-9, denom)
 
-    out[active_mask] = res
+    # single centroid: interior quantiles all map to the single mean
+    res = torch.where(n_real <= 1, cent_mean[0] + torch.zeros_like(qv), res)
+
+    out = torch.where(qv <= 0, t_min + torch.zeros_like(qv),
+          torch.where(qv >= 1, t_max + torch.zeros_like(qv), res))
+    # empty digest -> nan, matching the original behavior
+    out = torch.where(n_real == 0, torch.full_like(out, float("nan")), out)
     return out
 
 
@@ -620,12 +658,18 @@ class DQuantileScalerTensor(DBaseScalerTensor):
         min_val: Minimum value for quantile to prevent -inf results when distribution is normal or logistic.
         max_val: Maximum value for quantile to prevent inf results when distribution is normal or logistic.
         channels_last: Whether to assume the last dim or second dim are the channel/variable dimension.
+        compile: If True, transform/inverse_transform run through a cached ``torch.compile(fullgraph=True)`` of the
+            vmapped per-variable kernel, which fuses the many elementwise ops for a sizable speedup on CPU/CUDA.
+            Compilation is skipped on MPS (its inductor backend is immature and the ``_bucketize`` fallback already
+            handles MPS); the default False preserves the plain eager-vmap behavior.
     """
-    def __init__(self, compression=250, distribution="uniform", min_val=0.0000001, max_val=0.9999999, channels_last=True):
+    def __init__(self, compression=250, distribution="uniform", min_val=0.0000001, max_val=0.9999999,
+                 channels_last=True, compile=False):
         self.compression = compression
         self.distribution = distribution
         self.min_val = min_val
         self.max_val = max_val
+        self.compile = compile
         self.centroids_ = None
         self.size_ = None
         self.min_ = None
@@ -634,6 +678,10 @@ class DQuantileScalerTensor(DBaseScalerTensor):
         self.centroids_weight_tensor = None
         self.min_tensor = None
         self.max_tensor = None
+        # Padded/stacked centroid tensors used by the vmap-parallelized transforms.
+        self.centroids_mean_stacked = None    # (n_vars, max_centroids), padding means = +inf
+        self.centroids_weight_stacked = None  # (n_vars, max_centroids), padding weights = 0
+        self.centroids_count = None           # (n_vars,) number of real centroids per variable
 
         super().__init__(channels_last=channels_last)
 
@@ -662,6 +710,39 @@ class DQuantileScalerTensor(DBaseScalerTensor):
         self.centroids_weight_tensor = [torch.from_numpy(c[:, 1]) for c in self.centroids_]  # "weight"
         self.min_tensor = torch.from_numpy(self.min_)
         self.max_tensor = torch.from_numpy(self.max_)
+        self.build_stacked_centroids()
+        return
+
+    def build_stacked_centroids(self):
+        """Pad the ragged per-variable centroid lists into rectangular tensors for ``torch.vmap``.
+
+        Each variable's TDigest has a different number of centroids, so the per-variable ``(k_i,)`` mean/weight
+        tensors cannot be batched directly. This pads every variable to ``K = max(k_i)`` columns, filling padding
+        means with ``+inf`` (so they sort past all real centroids and are never selected by ``searchsorted``) and
+        padding weights with ``0`` (so they contribute nothing to the cumulative/total weights). ``centroids_count``
+        records the real centroid count per variable so the transform kernels know where the padding begins.
+        """
+        means = self.centroids_mean_tensor
+        weights = self.centroids_weight_tensor
+        counts = [m.shape[0] for m in means]
+        n_vars = len(means)
+        max_k = max(counts) if counts else 0
+        dtype = means[0].dtype if n_vars else torch.float64
+        mean_stacked = torch.full((n_vars, max_k), float("inf"), dtype=dtype)
+        weight_stacked = torch.zeros((n_vars, max_k), dtype=dtype)
+        for i, (m, w) in enumerate(zip(means, weights)):
+            k = m.shape[0]
+            mean_stacked[i, :k] = m
+            weight_stacked[i, :k] = w
+        self.centroids_mean_stacked = mean_stacked
+        self.centroids_weight_stacked = weight_stacked
+        self.centroids_count = torch.tensor(counts, dtype=torch.long)
+        return
+
+    def ensure_stacked_centroids(self):
+        """Rebuild the stacked centroid tensors if missing (e.g. loaded from an older serialized scaler)."""
+        if self.centroids_mean_stacked is None and self.centroids_mean_tensor is not None:
+            self.build_stacked_centroids()
         return
 
     def fit(self, x, weight=None):
@@ -696,25 +777,57 @@ class DQuantileScalerTensor(DBaseScalerTensor):
         self._fit = True
         return
 
+    def _gather_scales(self, x_col_order, xv):
+        """Select and stack the padded centroid parameters for the requested variables onto ``xv``'s device.
+
+        Returns per-variable tensors aligned with the channel order of ``xv`` (indexed by ``x_col_order``):
+        stacked means ``(n_sel, K)``, stacked weights ``(n_sel, K)``, min ``(n_sel,)``, max ``(n_sel,)``, and
+        real-centroid counts ``(n_sel,)`` — ready to be mapped over dim 0 by ``torch.vmap``.
+        """
+        self.ensure_stacked_centroids()
+        order = torch.as_tensor(x_col_order, dtype=torch.long)
+        mean = self.centroids_mean_stacked.index_select(0, order).to(xv.device, dtype=xv.dtype)
+        weight = self.centroids_weight_stacked.index_select(0, order).to(xv.device, dtype=xv.dtype)
+        t_min = self.min_tensor.index_select(0, order).to(xv.device, dtype=xv.dtype)
+        t_max = self.max_tensor.index_select(0, order).to(xv.device, dtype=xv.dtype)
+        n_real = self.centroids_count.index_select(0, order).to(xv.device)
+        return mean, weight, t_min, t_max, n_real
+
+    def _get_batched_fn(self, kind, channel_dim, device_type):
+        """Build (and cache) the vmapped per-variable transform, optionally wrapped in ``torch.compile``.
+
+        The per-variable kernel is mapped over the channel dimension (stacked params on dim 0, xv on
+        ``channel_dim``). When ``self.compile`` is set and the data is not on MPS, the vmapped function is wrapped
+        in ``torch.compile(fullgraph=True)`` so inductor fuses the many elementwise ops into a few kernels. The
+        cache is keyed by ``(kind, channel_dim, use_compile)`` so channels-first/last and compiled/eager variants
+        coexist, and lives in a module-level weak map so nothing non-serializable lands on the scaler.
+        """
+        use_compile = bool(self.compile) and device_type != "mps"
+        key = (kind, channel_dim, use_compile)
+        cache = _BATCHED_CACHE.get(self)
+        if cache is None:
+            cache = {}
+            _BATCHED_CACHE[self] = cache
+        batched = cache.get(key)
+        if batched is None:
+            if kind == "transform":
+                base = partial(transform_variable_tensor, min_val=self.min_val, max_val=self.max_val,
+                               distribution=self.distribution)
+            else:
+                base = partial(inv_transform_variable_tensor, distribution=self.distribution)
+            batched = torch.vmap(base, in_dims=(0, 0, 0, 0, 0, channel_dim), out_dims=channel_dim)
+            if use_compile:
+                batched = torch.compile(batched, fullgraph=True)
+            cache[key] = batched
+        return batched
+
     def transform(self, x, channels_last=None):
         xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
-
-        trans_var_func = partial(transform_variable_tensor,
-                                 min_val=self.min_val, max_val=self.max_val,
-                                 distribution=self.distribution)
-
-        if channels_last:
-            for i, o in enumerate(x_col_order):
-                x_transformed[..., i] = trans_var_func(self.centroids_mean_tensor[o].to(xv.device, dtype=xv.dtype),
-                                                       self.centroids_weight_tensor[o].to(xv.device, dtype=xv.dtype),
-                                                       self.min_tensor[o].to(xv.device, dtype=xv.dtype),
-                                                       self.max_tensor[o].to(xv.device, dtype=xv.dtype), xv[..., i])
-        else:
-            for i, o in enumerate(x_col_order):
-                x_transformed[:, i] = trans_var_func(self.centroids_mean_tensor[o].to(xv.device, dtype=xv.dtype),
-                                                     self.centroids_weight_tensor[o].to(xv.device, dtype=xv.dtype),
-                                                     self.min_tensor[o].to(xv.device, dtype=xv.dtype),
-                                                     self.max_tensor[o].to(xv.device, dtype=xv.dtype), xv[:, i])
+        mean, weight, t_min, t_max, n_real = self._gather_scales(x_col_order, xv)
+        # vmap parallelizes the per-variable transform over the channel dimension, which is far faster than a
+        # Python loop; when compile is enabled the fused torch.compile variant is used (see _get_batched_fn).
+        batched = self._get_batched_fn("transform", channel_dim, xv.device.type)
+        x_transformed = batched(mean, weight, t_min, t_max, n_real, xv)
 
         x_transformed_final = self.package_transformed_x(x_transformed, x)
         return x_transformed_final
@@ -725,19 +838,10 @@ class DQuantileScalerTensor(DBaseScalerTensor):
 
     def inverse_transform(self, x, channels_last=None):
         xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
+        mean, weight, t_min, t_max, n_real = self._gather_scales(x_col_order, xv)
 
-        inv_trans_var_func = partial(inv_transform_variable_tensor,
-                                     distribution=self.distribution)
-        if channels_last:
-            for i, o in enumerate(x_col_order):
-                x_transformed[..., i] = inv_trans_var_func(self.centroids_mean_tensor[o].to(xv.device, dtype=xv.dtype),
-                                                           self.centroids_weight_tensor[o].to(xv.device, dtype=xv.dtype),
-                                                           self.min_tensor[o], self.max_tensor[o], xv[..., i])
-        else:
-            for i, o in enumerate(x_col_order):
-                x_transformed[:, i] = inv_trans_var_func(self.centroids_mean_tensor[o].to(xv.device, dtype=xv.dtype),
-                                                         self.centroids_weight_tensor[o].to(xv.device, dtype=xv.dtype),
-                                                         self.min_tensor[o], self.max_tensor[o], xv[:, i])
+        batched = self._get_batched_fn("inverse", channel_dim, xv.device.type)
+        x_transformed = batched(mean, weight, t_min, t_max, n_real, xv)
 
         x_transformed_final = self.package_transformed_x(x_transformed, x)
         return x_transformed_final
