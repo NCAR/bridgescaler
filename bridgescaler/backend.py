@@ -134,7 +134,9 @@ def read_scaler(scaler_str):
 
         # 2. Handle Tensors & Special Cases
         elif is_tensor:
-            if isinstance(v, str) or (k == "x_columns_") or (k == "centroids_"):
+            if v is None:
+                value = None  # keep unset/lazy attributes (e.g. lazily-built fast_transform knots) as None
+            elif isinstance(v, str) or (k == "x_columns_") or (k == "centroids_"):
                 value = v # keep as it is
             elif (k == "centroids_mean_tensor") or (k == "centroids_weight_tensor"):
                 value = [torch.tensor(c) for c in v]  # convert to a list with tensors

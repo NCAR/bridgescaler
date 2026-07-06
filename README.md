@@ -100,6 +100,34 @@ dss_combined = np.sum([dss_1, dss_2])
 dss_combined.transform(x_1, channels_last=False)
 ```
 
+#### PyTorch Tensor Scalers
+If PyTorch (>= 2.0) is installed, tensor versions of the distributed scalers are available in
+`bridgescaler.distributed_tensor` (`DStandardScalerTensor`, `DMinMaxScalerTensor`,
+`DQuantileScalerTensor`). They operate directly on `torch.Tensor` inputs and run on CPU or GPU,
+mirroring the numpy API (fit/transform/inverse_transform, summing to combine, and channels-last or
+channels-first layouts). Variable names are carried on a `variable_names` attribute of the tensor so
+subsets and reordering work as with pandas/xarray.
+
+`DQuantileScalerTensor` supports two performance options:
+* `compile=True` wraps the vmapped per-variable kernel in `torch.compile` for a sizable speedup on
+  CPU/CUDA (skipped on MPS).
+* `fast_transform=True` replaces the exact TDigest CDF/quantile evaluation in both `transform` and
+  `inverse_transform` with a per-variable monotone-cubic (PCHIP) approximation fit to the fitted
+  quantile curve. This trades a small, tail-concentrated approximation error (typically well below
+  the TDigest's own error) for roughly a 3x transform speedup. `n_knots` (default 256) controls the
+  number of interpolation knots. The knots are derived from the digest and rebuilt automatically when
+  the scaler is re-fit or combined.
+
+```python
+from bridgescaler.distributed_tensor import DQuantileScalerTensor
+import torch
+
+x = torch.rand(10000, 4)
+scaler = DQuantileScalerTensor(distribution="normal", fast_transform=True)
+x_transformed = scaler.fit_transform(x)
+x_restored = scaler.inverse_transform(x_transformed)
+```
+
 ### Group Scaler
 The group scalers use the same scaling parameters for a group of similar
 variables rather than scaling each column independently. This is useful for situations where variables are related, 

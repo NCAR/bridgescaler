@@ -645,6 +645,94 @@ def tdigest_quantile_tensor(qv, cent_mean, cent_weight, t_min, t_max, n_real):
     return out
 
 
+def compute_pchip_slopes(x, y):
+    """Vectorized Fritsch-Carlson monotone-cubic slopes (matching scipy's PchipInterpolator).
+
+    Computes the derivative at every knot for a shape-preserving monotone cubic Hermite spline, for
+    each variable (row) of ``x``/``y`` at once. Interior slopes use the weighted-harmonic-mean rule
+    (set to 0 at local extrema so the spline never overshoots); endpoints use scipy's non-centered
+    three-point edge formula with the same monotonicity limiting.
+
+    Args:
+        x (numpy.ndarray): strictly-increasing knot locations, shape ``(n_vars, M)``.
+        y (numpy.ndarray): knot values, shape ``(n_vars, M)``.
+
+    Returns:
+        numpy.ndarray: knot slopes, shape ``(n_vars, M)``.
+    """
+    n, M = x.shape
+    m = np.zeros_like(x)
+    # tied knots (bumped by a tiny epsilon at saturated tails) produce huge/degenerate secants; the results
+    # there are discarded by the monotonicity masks below, so suppress the expected divide/invalid warnings.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        h = np.diff(x, axis=1)
+        delta = np.diff(y, axis=1) / h
+        if M < 3:
+            m[:, 0] = delta[:, 0]
+            m[:, -1] = delta[:, -1]
+            return m
+        hk = h[:, 1:]
+        hk1 = h[:, :-1]
+        dk = delta[:, 1:]
+        dk1 = delta[:, :-1]
+        w1 = 2 * hk + hk1
+        w2 = hk + 2 * hk1
+        m_int = (w1 + w2) / (w1 / dk1 + w2 / dk)
+        mono = (dk1 * dk) > 0  # only assign a nonzero slope where the secants agree in sign
+        m[:, 1:-1] = np.where(mono, m_int, 0.0)
+
+        def edge(h0, h1, d0, d1):
+            me = ((2 * h0 + h1) * d0 - h0 * d1) / (h0 + h1)
+            me = np.where(np.sign(me) != np.sign(d0), 0.0, me)
+            limit = (np.sign(d0) != np.sign(d1)) & (np.abs(me) > 3 * np.abs(d0))
+            return np.where(limit, 3 * d0, me)
+
+        m[:, 0] = edge(h[:, 0], h[:, 1], delta[:, 0], delta[:, 1])
+        m[:, -1] = edge(h[:, -1], h[:, -2], delta[:, -1], delta[:, -2])
+    return m
+
+
+def pchip_eval_tensor(x_knots, z_knots, m_knots, xv):
+    """Per-variable monotone cubic-Hermite (PCHIP) evaluation of the fitted transform (fast path).
+
+    Written branchlessly / fixed-shape so it composes with ``torch.vmap`` over the channel dimension.
+    Locates each element of ``xv`` among the ascending ``x_knots`` (via ``_bucketize`` for MPS
+    friendliness), then evaluates the Hermite cubic using the precomputed knot slopes ``m_knots``.
+    Values outside ``[x_knots[0], x_knots[-1]]`` saturate to the end z-knots, which equal
+    ``dist_ppf(min_val)`` / ``dist_ppf(max_val)`` -- matching the exact path's ``min_val``/``max_val``
+    clamping.
+
+    Args:
+        x_knots (torch.Tensor): ascending knot locations for one variable, shape ``(M,)``.
+        z_knots (torch.Tensor): transformed value at each knot, shape ``(M,)`` (shared across vars).
+        m_knots (torch.Tensor): PCHIP slope at each knot for one variable, shape ``(M,)``.
+        xv (torch.Tensor): values to transform, any shape.
+
+    Returns:
+        torch.Tensor: transformed values with the same shape as ``xv``.
+    """
+    M = x_knots.shape[0]
+    i = torch.clamp(_bucketize(x_knots, xv, "left"), 1, M - 1)
+    x0 = x_knots[i - 1]
+    x1 = x_knots[i]
+    y0 = z_knots[i - 1]
+    y1 = z_knots[i]
+    m0 = m_knots[i - 1]
+    m1 = m_knots[i]
+    h = x1 - x0
+    t = (xv - x0) / torch.where(h == 0, torch.ones_like(h), h)
+    t2 = t * t
+    t3 = t2 * t
+    h00 = 2 * t3 - 3 * t2 + 1
+    h10 = t3 - 2 * t2 + t
+    h01 = -2 * t3 + 3 * t2
+    h11 = t3 - t2
+    z = h00 * y0 + h10 * h * m0 + h01 * y1 + h11 * h * m1
+    z = torch.where(xv <= x_knots[0], z_knots[0], z)
+    z = torch.where(xv >= x_knots[-1], z_knots[-1], z)
+    return z
+
+
 class DQuantileScalerTensor(DBaseScalerTensor):
     """
     Distributed Quantile Scaler for tensors that uses the crick TDigest Cython library to compute quantiles across multiple
@@ -662,14 +750,24 @@ class DQuantileScalerTensor(DBaseScalerTensor):
             vmapped per-variable kernel, which fuses the many elementwise ops for a sizable speedup on CPU/CUDA.
             Compilation is skipped on MPS (its inductor backend is immature and the ``_bucketize`` fallback already
             handles MPS); the default False preserves the plain eager-vmap behavior.
+        fast_transform: If True, ``transform`` and ``inverse_transform`` use a monotone cubic (PCHIP) approximation
+            of the fitted mapping instead of the exact TDigest CDF/quantile evaluation. Knots are placed at
+            ``n_knots`` levels spaced uniformly in the output space; each direction is interpolated with a single
+            searchsorted over ``n_knots`` (far fewer ops than the full kernel) for roughly a 3x speedup, at the cost
+            of a small approximation error that is typically well below the TDigest's own error (see
+            scripts/quantile_lut_experiment.py). Default False.
+        n_knots: Number of PCHIP knots per variable when ``fast_transform`` is enabled (default 256). Ignored
+            otherwise. Must be >= 4.
     """
     def __init__(self, compression=250, distribution="uniform", min_val=0.0000001, max_val=0.9999999,
-                 channels_last=True, compile=False):
+                 channels_last=True, compile=False, fast_transform=False, n_knots=256):
         self.compression = compression
         self.distribution = distribution
         self.min_val = min_val
         self.max_val = max_val
         self.compile = compile
+        self.fast_transform = fast_transform
+        self.n_knots = n_knots
         self.centroids_ = None
         self.size_ = None
         self.min_ = None
@@ -682,6 +780,12 @@ class DQuantileScalerTensor(DBaseScalerTensor):
         self.centroids_mean_stacked = None    # (n_vars, max_centroids), padding means = +inf
         self.centroids_weight_stacked = None  # (n_vars, max_centroids), padding weights = 0
         self.centroids_count = None           # (n_vars,) number of real centroids per variable
+        # PCHIP knots for the optional fast_transform path; derived from the digest, rebuilt lazily,
+        # invalidated on every fit/merge (see tensorize_attributes / ensure_pchip_knots).
+        self.knots_x_ = None                  # (n_vars, n_knots) ascending knot locations
+        self.knots_z_ = None                  # (n_knots,) transformed value at each knot (shared)
+        self.knots_m_ = None                  # (n_vars, n_knots) forward PCHIP slopes dz/dx at the knots
+        self.knots_minv_ = None               # (n_vars, n_knots) inverse PCHIP slopes dx/dz at the knots
 
         super().__init__(channels_last=channels_last)
 
@@ -711,6 +815,11 @@ class DQuantileScalerTensor(DBaseScalerTensor):
         self.min_tensor = torch.from_numpy(self.min_)
         self.max_tensor = torch.from_numpy(self.max_)
         self.build_stacked_centroids()
+        # invalidate any fast_transform knots; they are rebuilt lazily from the updated digest
+        self.knots_x_ = None
+        self.knots_z_ = None
+        self.knots_m_ = None
+        self.knots_minv_ = None
         return
 
     def build_stacked_centroids(self):
@@ -743,6 +852,66 @@ class DQuantileScalerTensor(DBaseScalerTensor):
         """Rebuild the stacked centroid tensors if missing (e.g. loaded from an older serialized scaler)."""
         if self.centroids_mean_stacked is None and self.centroids_mean_tensor is not None:
             self.build_stacked_centroids()
+        return
+
+    def build_pchip_knots(self):
+        """Build per-variable monotone-cubic (PCHIP) knots approximating the exact transform (fast path).
+
+        Knots are spaced uniformly in the *output* ``z`` over ``[dist_ppf(min_val), dist_ppf(max_val)]`` rather than
+        in probability, which bounds the per-bin output error (each bin spans a fixed z-height) regardless of the
+        input distribution -- equal-probability spacing badly under-resolves the steep tails. Each z-knot is mapped
+        to a probability via the distribution CDF, and the x-knot is the digest quantile at that probability (via
+        ``tdigest_quantile_tensor``). Together with the PCHIP slopes these let ``transform`` interpolate ``x -> z``
+        with a single searchsorted over ``n_knots``, instead of the full TDigest CDF evaluation. Cheap and one-time;
+        rebuilt lazily and invalidated on every fit/merge.
+        """
+        assert self.is_fit(), "Scaler has not been fit."
+        assert self.n_knots >= 4, "fast_transform requires n_knots >= 4."
+        self.ensure_stacked_centroids()
+        M = int(self.n_knots)
+        dtype = self.centroids_mean_stacked.dtype
+        # z-knots: uniform in output space between the distribution ppf of min_val and max_val; p = dist_cdf(z)
+        if self.distribution == "normal":
+            z_lo, z_hi = torch.special.ndtri(torch.tensor([self.min_val, self.max_val], dtype=dtype))
+            z_knots = torch.linspace(float(z_lo), float(z_hi), M, dtype=dtype)
+            p = torch.special.ndtr(z_knots)
+        elif self.distribution == "logistic":
+            z_lo, z_hi = torch.logit(torch.tensor([self.min_val, self.max_val], dtype=dtype))
+            z_knots = torch.linspace(float(z_lo), float(z_hi), M, dtype=dtype)
+            p = torch.sigmoid(z_knots)
+        else:  # uniform: transform output is the CDF itself, so z == p
+            z_knots = torch.linspace(self.min_val, self.max_val, M, dtype=dtype)
+            p = z_knots.clone()
+        p = torch.clamp(p, self.min_val, self.max_val)
+        # x-knots: digest quantile of each probability level, computed for every variable at once via vmap
+        qfn = torch.vmap(tdigest_quantile_tensor, in_dims=(None, 0, 0, 0, 0, 0))
+        x_knots = qfn(p,
+                      self.centroids_mean_stacked,
+                      self.centroids_weight_stacked,
+                      self.min_tensor.to(dtype),
+                      self.max_tensor.to(dtype),
+                      self.centroids_count)
+        x_np = x_knots.cpu().numpy()
+        # enforce strictly-increasing x per variable (quantiles can tie at saturated tails), which PCHIP requires
+        x_np = np.maximum.accumulate(x_np, axis=1)
+        ties = np.diff(x_np, axis=1) <= 0
+        if ties.any():
+            x_np[:, 1:][ties] = x_np[:, :-1][ties] + 1e-12
+        z_np = np.broadcast_to(z_knots.cpu().numpy(), x_np.shape).copy()
+        # forward slopes dz/dx (transform) and inverse slopes dx/dz (inverse_transform); z-knots are strictly
+        # increasing so the inverse fit needs no de-duplication, while x-knots were made monotone above.
+        m_np = compute_pchip_slopes(x_np, z_np)
+        minv_np = compute_pchip_slopes(z_np, x_np)
+        self.knots_x_ = torch.from_numpy(np.ascontiguousarray(x_np))
+        self.knots_z_ = z_knots.to(torch.float64)
+        self.knots_m_ = torch.from_numpy(np.ascontiguousarray(m_np))
+        self.knots_minv_ = torch.from_numpy(np.ascontiguousarray(minv_np))
+        return
+
+    def ensure_pchip_knots(self):
+        """Build the fast_transform knots if missing (lazily, and after load / refit / merge)."""
+        if self.knots_x_ is None and self.is_fit():
+            self.build_pchip_knots()
         return
 
     def fit(self, x, weight=None):
@@ -821,8 +990,48 @@ class DQuantileScalerTensor(DBaseScalerTensor):
             cache[key] = batched
         return batched
 
+    def _get_fast_fn(self, kind, channel_dim, device_type):
+        """Build (and cache) the vmapped PCHIP evaluator for the fast_transform path.
+
+        Mirrors ``_get_batched_fn`` but maps ``pchip_eval_tensor`` over the channel dimension. The search/output
+        roles swap between directions: for ``"transform"`` the search knots are the per-variable x-knots and the
+        outputs are the shared z-knots; for ``"inverse"`` the search knots are the shared z-knots and the outputs
+        are the per-variable x-knots. ``in_dims`` places the per-variable arg on dim 0 and the shared arg at
+        ``None`` accordingly. Optionally torch.compiled off MPS.
+        """
+        use_compile = bool(self.compile) and device_type != "mps"
+        # namespaced ("fast_*") so these keys never collide with _get_batched_fn's ("transform"/"inverse")
+        # entries in the shared _BATCHED_CACHE
+        key = ("fast_" + kind, channel_dim, use_compile)
+        cache = _BATCHED_CACHE.get(self)
+        if cache is None:
+            cache = {}
+            _BATCHED_CACHE[self] = cache
+        batched = cache.get(key)
+        if batched is None:
+            # transform: (x_knots per-var, z_knots shared, slopes per-var, data on channel_dim)
+            # inverse:   (z_knots shared, x_knots per-var, slopes per-var, data on channel_dim)
+            in_dims = (0, None, 0, channel_dim) if kind == "transform" else (None, 0, 0, channel_dim)
+            batched = torch.vmap(pchip_eval_tensor, in_dims=in_dims, out_dims=channel_dim)
+            if use_compile:
+                batched = torch.compile(batched, fullgraph=True)
+            cache[key] = batched
+        return batched
+
     def transform(self, x, channels_last=None):
         xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
+        if self.fast_transform:
+            # Approximate path: interpolate the fitted transform with a per-variable monotone cubic (PCHIP),
+            # replacing the exact TDigest CDF evaluation with a single searchsorted over n_knots. Knots follow
+            # the requested channel order (x_col_order) and are moved onto xv's device/dtype.
+            self.ensure_pchip_knots()
+            order = torch.as_tensor(x_col_order, dtype=torch.long)
+            xk = self.knots_x_.index_select(0, order).to(xv.device, dtype=xv.dtype)
+            mk = self.knots_m_.index_select(0, order).to(xv.device, dtype=xv.dtype)
+            zk = self.knots_z_.to(xv.device, dtype=xv.dtype)
+            batched = self._get_fast_fn("transform", channel_dim, xv.device.type)
+            x_transformed = batched(xk, zk, mk, xv)
+            return self.package_transformed_x(x_transformed, x)
         mean, weight, t_min, t_max, n_real = self._gather_scales(x_col_order, xv)
         # vmap parallelizes the per-variable transform over the channel dimension, which is far faster than a
         # Python loop; when compile is enabled the fused torch.compile variant is used (see _get_batched_fn).
@@ -838,6 +1047,18 @@ class DQuantileScalerTensor(DBaseScalerTensor):
 
     def inverse_transform(self, x, channels_last=None):
         xv, x_transformed, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
+        if self.fast_transform:
+            # Approximate path: interpolate the fitted inverse with a per-variable monotone cubic (PCHIP),
+            # searching the input z-values in the shared z-knots and interpolating to the per-variable x-knots
+            # (roles swapped relative to transform). Uses the precomputed dx/dz slopes (knots_minv_).
+            self.ensure_pchip_knots()
+            order = torch.as_tensor(x_col_order, dtype=torch.long)
+            zk = self.knots_z_.to(xv.device, dtype=xv.dtype)
+            xk = self.knots_x_.index_select(0, order).to(xv.device, dtype=xv.dtype)
+            mk = self.knots_minv_.index_select(0, order).to(xv.device, dtype=xv.dtype)
+            batched = self._get_fast_fn("inverse", channel_dim, xv.device.type)
+            x_transformed = batched(zk, xk, mk, xv)
+            return self.package_transformed_x(x_transformed, x)
         mean, weight, t_min, t_max, n_real = self._gather_scales(x_col_order, xv)
 
         batched = self._get_batched_fn("inverse", channel_dim, xv.device.type)

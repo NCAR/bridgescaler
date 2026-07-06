@@ -5,6 +5,26 @@ import numpy as np
 import pytest
 import torch
 import os
+import functools
+
+
+@functools.lru_cache(maxsize=1)
+def _inductor_cpu_available():
+    """Probe whether torch.compile's Inductor CPU backend can actually build a kernel.
+
+    On some HPC module environments the ``g++`` on PATH is a wrapper (e.g. NCAR's
+    ``ncarcompilers``) that injects link flags, which breaks Inductor's header-only
+    precompile step and raises a CppCompileError. That is a toolchain issue, not a
+    bridgescaler bug, so tests that require compilation skip rather than fail.
+    Set ``CXX`` to a plain g++ to make this probe (and the compile path) succeed.
+    """
+    try:
+        fn = torch.compile(lambda t: t * 2 + 1, fullgraph=True)
+        fn(torch.randn(4))
+    except Exception:
+        return False
+    return True
+
 
 def make_test_data():
     np.random.seed(34325)
@@ -296,9 +316,72 @@ def test_tensor_scaler_with_attribute():
         #assert scaler.transform(x_attr).is_cuda == False, "device should be CPU"
 
 
+def test_dquantile_tensor_fast_transform():
+    # fast_transform replaces the exact TDigest CDF/quantile eval with a per-variable monotone-cubic (PCHIP)
+    # approximation in BOTH directions. Knots are lazy (built on first transform, invalidated on refit) and must
+    # survive save/load, compose with channels_first + column subsetting, and match the exact path in the bulk.
+    rng = np.random.default_rng(0)
+    for dist in ["uniform", "normal", "logistic"]:
+        data = np.stack([rng.lognormal(0, 1, 6000), rng.normal(3, 2, 6000),
+                         rng.uniform(-1, 1, 6000), rng.exponential(2.0, 6000)], axis=1)
+        x = torch.from_numpy(data.copy())
+        exact = DQuantileScalerTensor(distribution=dist)
+        fast = DQuantileScalerTensor(distribution=dist, fast_transform=True, n_knots=256)
+        exact.fit(x)
+        fast.fit(x)
+        assert fast.knots_x_ is None, "knots should be lazy (unbuilt) right after fit"
+        ze = exact.transform(x)
+        zf = fast.transform(x)
+        assert fast.knots_x_ is not None, "knots should be built on first transform"
+        assert torch.all(~torch.isnan(zf)) and zf.shape == x.shape, f"bad fast transform for {dist}"
+        # bulk (99th percentile) error vs the exact path is small; the extreme tail worst-case is larger by design
+        assert torch.quantile(torch.abs(zf - ze), 0.99) < 0.05, f"fast_transform bulk error too high for {dist}"
+        # fast inverse vs exact inverse (both applied to the exact-transform output), in data space
+        xe = exact.inverse_transform(ze)
+        xf = fast.inverse_transform(ze)
+        assert torch.all(~torch.isnan(xf)) and xf.shape == x.shape, f"bad fast inverse for {dist}"
+        tol = 0.05 * (xe.max() - xe.min())
+        assert torch.quantile(torch.abs(xf - xe), 0.99) < tol, f"fast inverse bulk error too high for {dist}"
+
+    # refit invalidates the cached knots so a stale curve is never reused
+    fast.fit(x)
+    assert fast.knots_x_ is None, "refit must invalidate fast_transform knots"
+
+    # channels_first + column subsetting/reordering compose with the fast path
+    x4 = torch.randn(400, 4, 4, 4, dtype=torch.float64)
+    for c in range(4):
+        x4[:, c] = x4[:, c] * (c + 1) + c
+    x4.variable_names = ["a", "b", "c", "d"]
+    fast_cf = DQuantileScalerTensor(distribution="normal", channels_last=False, fast_transform=True)
+    full = fast_cf.fit_transform(x4)
+    x_sel = x4[:, [0, 2, 1], :, :].clone()
+    x_sel.variable_names = ["a", "c", "b"]
+    assert torch.allclose(fast_cf.transform(x_sel), full[:, [0, 2, 1]], atol=1e-9), \
+        "fast_transform must respect column subsetting/reordering"
+
+    # save/load round-trip: lazy (knots None) and after knots are built
+    data = torch.from_numpy(rng.lognormal(0, 1, (4000, 3)))
+    s = DQuantileScalerTensor(distribution="normal", fast_transform=True)
+    s.fit(data)
+    save_scaler(s, "fast_scaler.json")
+    s2 = load_scaler("fast_scaler.json")
+    os.remove("fast_scaler.json")
+    assert s2.fast_transform is True and int(s2.n_knots) == 256, "fast_transform config lost on load"
+    assert s2.knots_x_ is None, "unbuilt knots should load back as None"
+    assert torch.allclose(s2.transform(data), s.transform(data), atol=1e-9), "fast transform changed after load"
+    save_scaler(s, "fast_scaler.json")  # now knots are built
+    s3 = load_scaler("fast_scaler.json")
+    os.remove("fast_scaler.json")
+    assert torch.is_tensor(s3.knots_x_), "built knots should round-trip as a tensor"
+    assert torch.allclose(s3.transform(data), s.transform(data), atol=1e-9), "fast transform changed after load"
+
+
 def test_dquantile_tensor_compile_matches_eager():
     # compile=True uses torch.compile(fullgraph=True) on the vmapped kernel. fullgraph=True raises on any graph
     # break, so if this runs at all there is no graph break; we also assert it matches the eager path exactly.
+    if not _inductor_cpu_available():
+        pytest.skip("torch.compile Inductor CPU backend cannot build kernels in this environment "
+                    "(likely a compiler-toolchain issue; set CXX to a plain g++)")
     torch.manual_seed(7)
     x = torch.randn(6, 8, 4, 5, dtype=torch.float64)
     for c in range(x.shape[1]):
