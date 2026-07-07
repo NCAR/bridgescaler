@@ -134,10 +134,18 @@ def read_scaler(scaler_str):
 
         # 2. Handle Tensors & Special Cases
         elif is_tensor:
-            if isinstance(v, str) or (k == "x_columns_") or (k == "centroids_"):
+            if v is None:
+                value = None  # keep unset/lazy attributes (e.g. lazily-built fast_transform knots) as None
+            elif isinstance(v, str) or (k == "x_columns_") or (k == "centroids_"):
                 value = v # keep as it is
             elif (k == "centroids_mean_tensor") or (k == "centroids_weight_tensor"):
                 value = [torch.tensor(c) for c in v]  # convert to a list with tensors
+            elif isinstance(v, bool) and not isinstance(v, np.generic):
+                value = v  # keep python bool flags (e.g. channels_last, _fit) as-is
+            elif isinstance(v, (int, float)) and not isinstance(v, np.generic):
+                # keep python scalar params (e.g. min_val, max_val, compression) as-is; torch.tensor(float)
+                # would silently downcast to float32 and corrupt precision-sensitive values like max_val.
+                value = v
             elif isinstance(v, np.bool_):
                 value = torch.tensor(bool(v))
             else:
