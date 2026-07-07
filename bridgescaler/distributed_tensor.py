@@ -13,8 +13,6 @@ import numpy as np
 from numpy.lib.recfunctions import structured_to_unstructured, unstructured_to_structured
 CENTROID_DTYPE = np.dtype([('mean', np.float64), ('weight', np.float64)])
 
-warnings.simplefilter("always")
-
 # Cache of vmapped (and optionally torch.compiled) transform functions, keyed weakly by scaler instance so
 # nothing non-serializable is stored on the scaler's __dict__ and entries are dropped when the scaler is freed.
 _BATCHED_CACHE = weakref.WeakKeyDictionary()
