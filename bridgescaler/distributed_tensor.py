@@ -140,12 +140,15 @@ class DBaseScalerTensor:
         Returns:
             x_in_col_indices (list): integer indices of the input variables from x in the scaler in order.
         """
-        assert all(var in self.x_columns_ for var in x_in_columns), (
-            f"Some input variables not in scaler x_columns. "
-            f"Scaler: {self.x_columns_}, input variables: {x_in_columns}"
-        )
-        x_in_col_indices = [self.x_columns_.index(item) for item in x_in_columns if item in self.x_columns_]
+        col_index = {col: i for i, col in enumerate(self.x_columns_)}
+        missing = [var for var in x_in_columns if var not in col_index]
+        assert not missing, (
+          f"Some input variables not in scaler x_columns. "
+          f"Scaler: {self.x_columns_}, input variables: {x_in_columns}"
+        )   
+        x_in_col_indices = [col_index[item] for item in x_in_columns]
         return x_in_col_indices
+
 
     @staticmethod
     def package_transformed_x(x_transformed, x):
