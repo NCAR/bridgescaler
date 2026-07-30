@@ -238,50 +238,41 @@ class DStandardScalerTensor(DBaseScalerTensor):
         self.var_x_ = None
         super().__init__(channels_last=channels_last)
 
+    @staticmethod
+    def _nan_aware_stats(xv, reduce_dims, reshape_fn):
+        """Per-channel mean/variance/count that ignore NaNs at their exact positions.
+
+        A NaN anywhere in a channel must not poison that channel's stats for every other
+        position, so this masks NaNs out of the reduction instead of letting them propagate
+        through a plain mean/var. An all-NaN channel naturally yields ``n=0`` and
+        ``mean=var=nan`` with no special-casing required.
+        """
+        valid = ~torch.isnan(xv)
+        n = valid.sum(dim=reduce_dims).to(xv.dtype)
+        mean = torch.nanmean(xv, dim=reduce_dims)
+        mean_b = reshape_fn(mean, xv)
+        # torch.where, not valid * (xv - mean_b): 0 * nan is nan, so that would not zero anything.
+        dev = torch.where(valid, xv - mean_b, torch.zeros_like(xv))
+        var = (dev ** 2).sum(dim=reduce_dims) / n
+        return mean, var, n
+
     def fit(self, x, weight=None):
         x_columns, has_attribute = self.extract_x_columns(x, channels_last=self.channels_last)
         xv = x
         channel_dim = self.set_channel_dim()
+        reduce_dims = tuple(range(xv.ndim - 1)) if self.channels_last else tuple(d for d in range(xv.ndim) if d != 1)
+        reshape_fn = self.reshape_to_channels_last if self.channels_last else self.reshape_to_channels_first
         if not self._fit:
             self.x_columns_ = x_columns
-            if len(xv.shape) > 2:
-                if self.channels_last:
-                    self.n_ += torch.prod(torch.tensor(xv.shape[:-1], dtype=xv.dtype, device=xv.device))
-                else:
-                    self.n_ += xv.shape[0] * \
-                        torch.prod(torch.tensor(xv.shape[2:], dtype=xv.dtype, device=xv.device))
-            else:
-                self.n_ += xv.shape[0]
-            self.mean_x_ = torch.zeros(xv.shape[channel_dim], dtype=xv.dtype, device=xv.device)
-            self.var_x_ = torch.zeros(xv.shape[channel_dim], dtype=xv.dtype, device=xv.device)
-
-            if self.channels_last:
-                self.mean_x_ = torch.mean(xv, dim=tuple(range(xv.ndim - 1)))
-                self.var_x_ = torch.var(xv, dim=tuple(range(xv.ndim - 1)), correction=0)
-            else:
-                self.mean_x_ = torch.mean(xv, dim=tuple(d for d in range(xv.ndim) if d != 1))
-                self.var_x_ = torch.var(xv, dim=tuple(d for d in range(xv.ndim) if d != 1), correction=0)
-
+            self.mean_x_, self.var_x_, self.n_ = self._nan_aware_stats(xv, reduce_dims, reshape_fn)
         else:
             # Update existing scaler with new data
             assert (
                     x.shape[channel_dim] == len(self.x_columns_)
             ), "New data has a different number of variables."
             x_col_order = self.get_column_order(x_columns)
-            if len(xv.shape) > 2:
-                if self.channels_last:
-                    new_n = torch.prod(torch.tensor(xv.shape[:-1], dtype=xv.dtype, device=xv.device))
-                else:
-                    new_n = xv.shape[0] * \
-                        torch.prod(torch.tensor(xv.shape[2:], dtype=xv.dtype, device=xv.device))
-            else:
-                new_n = xv.shape[0]
-            if self.channels_last:
-                new_mean = torch.mean(xv[...,x_col_order], dim=tuple(range(xv.ndim - 1)))
-                new_var = torch.var(xv[...,x_col_order], dim=tuple(range(xv.ndim - 1)), correction=0)
-            else:
-                new_mean = torch.mean(xv[:, x_col_order], dim=tuple(d for d in range(xv.ndim) if d != 1))
-                new_var = torch.var(xv[:, x_col_order], dim=tuple(d for d in range(xv.ndim) if d != 1), correction=0)
+            sub = xv[..., x_col_order] if self.channels_last else xv[:, x_col_order]
+            new_mean, new_var, new_n = self._nan_aware_stats(sub, reduce_dims, reshape_fn)
             combined_mean = (self.n_ * self.mean_x_ + new_n * new_mean) / (
                 self.n_ + new_n
             )
@@ -378,17 +369,22 @@ class DMinMaxScalerTensor(DBaseScalerTensor):
         x_columns, has_attribute = self.extract_x_columns(x, channels_last=self.channels_last)
         xv = x
         channel_dim = self.set_channel_dim()
+        is_nan = torch.isnan(xv)
+        # NaN would otherwise poison amax/amin for the whole channel, so substitute the identity
+        # element for each reduction (a NaN can never be the max, so it becomes -inf; likewise +inf for min).
+        xv_for_max = torch.where(is_nan, torch.full_like(xv, float("-inf")), xv)
+        xv_for_min = torch.where(is_nan, torch.full_like(xv, float("inf")), xv)
         if not self._fit:
             self.x_columns_ = x_columns
             self.max_x_ = torch.zeros(xv.shape[channel_dim], dtype=xv.dtype, device=xv.device)
             self.min_x_ = torch.zeros(xv.shape[channel_dim], dtype=xv.dtype, device=xv.device)
 
             if self.channels_last:
-                self.max_x_ = torch.amax(xv, dim=tuple(range(xv.ndim - 1)))
-                self.min_x_ = torch.amin(xv, dim=tuple(range(xv.ndim - 1)))
+                self.max_x_ = torch.amax(xv_for_max, dim=tuple(range(xv.ndim - 1)))
+                self.min_x_ = torch.amin(xv_for_min, dim=tuple(range(xv.ndim - 1)))
             else:
-                self.max_x_ = torch.amax(xv, dim=tuple(d for d in range(xv.ndim) if d != 1))
-                self.min_x_ = torch.amin(xv, dim=tuple(d for d in range(xv.ndim) if d != 1))
+                self.max_x_ = torch.amax(xv_for_max, dim=tuple(d for d in range(xv.ndim) if d != 1))
+                self.min_x_ = torch.amin(xv_for_min, dim=tuple(d for d in range(xv.ndim) if d != 1))
         else:
             # Update existing scaler with new data
             assert (
@@ -397,16 +393,16 @@ class DMinMaxScalerTensor(DBaseScalerTensor):
             x_col_order = self.get_column_order(x_columns)
             if self.channels_last:
                 self.max_x_ = torch.maximum(
-                    self.max_x_, torch.amax(xv[...,x_col_order], dim=tuple(range(xv.ndim - 1)))
+                    self.max_x_, torch.amax(xv_for_max[...,x_col_order], dim=tuple(range(xv.ndim - 1)))
                 )
                 self.min_x_ = torch.minimum(
-                    self.min_x_, torch.amin(xv[...,x_col_order], dim=tuple(range(xv.ndim - 1)))
+                    self.min_x_, torch.amin(xv_for_min[...,x_col_order], dim=tuple(range(xv.ndim - 1)))
                 )
             else:
                 self.max_x_ = torch.maximum(
-                    self.max_x_, torch.amax(xv[:, x_col_order], dim=tuple(d for d in range(xv.ndim) if d != 1)))
+                    self.max_x_, torch.amax(xv_for_max[:, x_col_order], dim=tuple(d for d in range(xv.ndim) if d != 1)))
                 self.min_x_ = torch.minimum(
-                    self.min_x_, torch.amin(xv[:, x_col_order], dim=tuple(d for d in range(xv.ndim) if d != 1)))
+                    self.min_x_, torch.amin(xv_for_min[:, x_col_order], dim=tuple(d for d in range(xv.ndim) if d != 1)))
         self._fit = True
 
     def transform(self, x, channels_last=None):
