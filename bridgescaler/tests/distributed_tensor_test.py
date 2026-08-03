@@ -88,6 +88,109 @@ def test_dstandard_tensor_scaler():
     assert torch.max(torch.abs(var_4d - all_4d_var) / all_4d_var) < 1e-5, "significant difference in variances"
 
 
+def test_dstandard_scaler_nan_aware():
+    # A channel with real physical NaNs (e.g. SST over land) must not poison its own mean/var, and
+    # must match what you'd get by manually stripping the NaNs out and fitting on what's left.
+    torch.manual_seed(0)
+    n = 5000
+    is_valid = torch.rand(n) > 0.3  # ~30% NaN, like land fraction in an SST field
+    sst = torch.full((n,), float("nan"), dtype=torch.float64)
+    sst[is_valid] = torch.randn(int(is_valid.sum()), dtype=torch.float64) * 4 + 290
+    clean = torch.randn(n, dtype=torch.float64)
+    x = torch.stack([clean, sst], dim=1)
+    x.variable_names = ["clean", "sst"]
+
+    scaler_nan = DStandardScalerTensor(channels_last=True)
+    scaler_nan.fit(x)
+    mean_nan, var_nan = scaler_nan.get_scales()
+    sst_idx = scaler_nan.x_columns_.index("sst")
+    clean_idx = scaler_nan.x_columns_.index("clean")
+
+    # Same "sst" data with the NaN entries removed beforehand -- the ground truth the internal
+    # NaN-masking must match.
+    sst_stripped = sst[is_valid].reshape(-1, 1)
+    sst_stripped.variable_names = ["sst"]
+    scaler_stripped = DStandardScalerTensor(channels_last=True)
+    scaler_stripped.fit(sst_stripped)
+    mean_stripped, var_stripped = scaler_stripped.get_scales()
+
+    assert torch.isclose(mean_nan[sst_idx], mean_stripped[0], atol=1e-8), \
+        "mean differs between NaN-laced fit and manually NaN-stripped fit"
+    assert torch.isclose(var_nan[sst_idx], var_stripped[0], atol=1e-8), \
+        "variance differs between NaN-laced fit and manually NaN-stripped fit"
+    assert scaler_nan.n_[sst_idx] == int(is_valid.sum()), "count should equal number of valid (non-NaN) entries"
+
+    # The NaN-free channel must be completely unaffected (regression check against plain mean/var).
+    assert torch.isclose(mean_nan[clean_idx], clean.mean(), atol=1e-8)
+    assert torch.isclose(var_nan[clean_idx], clean.var(correction=0), atol=1e-8)
+    assert scaler_nan.n_[clean_idx] == n
+
+    # An all-NaN channel yields NaN stats and a zero count, without raising.
+    x_allnan = torch.stack([clean, torch.full((n,), float("nan"), dtype=torch.float64)], dim=1)
+    x_allnan.variable_names = ["clean", "all_nan"]
+    scaler_edge = DStandardScalerTensor(channels_last=True)
+    scaler_edge.fit(x_allnan)
+    mean_edge, var_edge = scaler_edge.get_scales()
+    edge_idx = scaler_edge.x_columns_.index("all_nan")
+    assert torch.isnan(mean_edge[edge_idx]) and torch.isnan(var_edge[edge_idx])
+    assert scaler_edge.n_[edge_idx] == 0
+
+    # transform (unmodified) still just passes NaN through elementwise at that one position.
+    row = torch.tensor([[0.5, float("nan")], [0.5, 300.0]], dtype=torch.float64)
+    row.variable_names = ["clean", "sst"]
+    out = scaler_nan.transform(row)
+    assert torch.isnan(out[0, 1]) and not torch.isnan(out[0, 0]), "NaN should not spread to other channels"
+    assert not torch.isnan(out[1, 1]), "clean value in the same channel should transform normally"
+
+
+def test_dminmax_scaler_nan_aware():
+    torch.manual_seed(1)
+    n = 5000
+    is_valid = torch.rand(n) > 0.3
+    sst = torch.full((n,), float("nan"), dtype=torch.float64)
+    sst[is_valid] = torch.randn(int(is_valid.sum()), dtype=torch.float64) * 4 + 290
+    clean = torch.randn(n, dtype=torch.float64)
+    x = torch.stack([clean, sst], dim=1)
+    x.variable_names = ["clean", "sst"]
+
+    scaler_nan = DMinMaxScalerTensor(channels_last=True)
+    scaler_nan.fit(x)
+    min_nan, max_nan = scaler_nan.get_scales()
+    sst_idx = scaler_nan.x_columns_.index("sst")
+    clean_idx = scaler_nan.x_columns_.index("clean")
+
+    sst_stripped = sst[is_valid].reshape(-1, 1)
+    sst_stripped.variable_names = ["sst"]
+    scaler_stripped = DMinMaxScalerTensor(channels_last=True)
+    scaler_stripped.fit(sst_stripped)
+    min_stripped, max_stripped = scaler_stripped.get_scales()
+
+    assert torch.isclose(min_nan[sst_idx], min_stripped[0], atol=1e-8), \
+        "min differs between NaN-laced fit and manually NaN-stripped fit"
+    assert torch.isclose(max_nan[sst_idx], max_stripped[0], atol=1e-8), \
+        "max differs between NaN-laced fit and manually NaN-stripped fit"
+
+    # The NaN-free channel must be completely unaffected (regression check).
+    assert torch.isclose(min_nan[clean_idx], clean.min())
+    assert torch.isclose(max_nan[clean_idx], clean.max())
+
+    # An all-NaN channel yields +inf/-inf (min > max, marking the channel as never having a valid
+    # value), without raising.
+    x_allnan = torch.stack([clean, torch.full((n,), float("nan"), dtype=torch.float64)], dim=1)
+    x_allnan.variable_names = ["clean", "all_nan"]
+    scaler_edge = DMinMaxScalerTensor(channels_last=True)
+    scaler_edge.fit(x_allnan)
+    min_edge, max_edge = scaler_edge.get_scales()
+    edge_idx = scaler_edge.x_columns_.index("all_nan")
+    assert torch.isinf(min_edge[edge_idx]) and torch.isinf(max_edge[edge_idx])
+
+    row = torch.tensor([[0.5, float("nan")], [0.5, 300.0]], dtype=torch.float64)
+    row.variable_names = ["clean", "sst"]
+    out = scaler_nan.transform(row)
+    assert torch.isnan(out[0, 1]) and not torch.isnan(out[0, 0]), "NaN should not spread to other channels"
+    assert not torch.isnan(out[1, 1]), "clean value in the same channel should transform normally"
+
+
 def test_dminmax_tensor_scaler():
     numpy_2d_1 = torch.from_numpy(test_data["numpy_2d"][0])
     numpy_2d_2 = torch.from_numpy(test_data["numpy_2d"][1])
