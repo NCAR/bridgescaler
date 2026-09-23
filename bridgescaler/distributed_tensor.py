@@ -189,7 +189,10 @@ class DBaseScalerTensor:
             ), "Number of input variables does not match scaler."
         x_col_order = self.get_column_order(x_in_cols)
         xv = x
-        x_transformed = torch.zeros(xv.shape, dtype=xv.dtype, device=xv.device)
+        # Every transform computes its output out of place, so no preallocated buffer is
+        # needed. Allocating one here cost a full-size copy of x per call (GPU OOM on
+        # large grids). None keeps the return tuple's shape for existing callers.
+        x_transformed = None
         return xv, x_transformed, channels_last, channel_dim, x_col_order
 
     def fit(self, x, weight=None):
