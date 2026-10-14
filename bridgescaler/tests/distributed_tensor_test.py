@@ -499,3 +499,43 @@ def test_dquantile_tensor_compile_matches_eager():
         ie = eager.inverse_transform(te)
         ic = comp.inverse_transform(tc)
         assert torch.allclose(ie, ic, atol=1e-6, equal_nan=True), f"compiled inverse != eager for {dist}"
+
+
+@pytest.mark.parametrize("scaler_cls", [DStandardScalerTensor, DMinMaxScalerTensor])
+@pytest.mark.parametrize("channels_last", [False, True])
+@pytest.mark.parametrize("perm", [[1, 0, 2, 3], [1, 2, 0, 3], [3, 0, 1, 2], [2, 3, 1, 0]])
+def test_tensor_scaler_refit_reordered_columns(scaler_cls, channels_last, perm):
+    """Refitting on data whose channels arrive in a different order must match one fit on all the data.
+
+    Covers a single swap and longer cycles: a swap is its own inverse, so it hid a bug where refit indexed the
+    input with the input->scaler map instead of its inverse and mixed up columns for any 3+ cycle.
+    """
+    torch.manual_seed(11)
+    names = ["a", "b", "c", "d"]
+    scale = torch.tensor([1.0, 10.0, 100.0, 1000.0])
+    offset = torch.tensor([0.0, 5.0, 50.0, -500.0])
+
+    def make(n):
+        x = torch.randn(n, 4, 3, 5, dtype=torch.float64) * scale.view(1, 4, 1, 1) + offset.view(1, 4, 1, 1)
+        return x.movedim(1, -1) if channels_last else x
+
+    def named(x, cols):
+        x = x.clone()
+        x.variable_names = cols
+        return x
+
+    channel_dim = -1 if channels_last else 1
+    x1, x2 = make(200), make(150)
+    x2_perm = x2.index_select(channel_dim, torch.tensor(perm))
+
+    refit = scaler_cls(channels_last=channels_last)
+    refit.fit(named(x1, names))
+    refit.fit(named(x2_perm, [names[i] for i in perm]))
+
+    reference = scaler_cls(channels_last=channels_last)
+    reference.fit(named(torch.cat([x1, x2]), names))
+
+    for got, expected in zip(refit.get_scales(), reference.get_scales()):
+        assert torch.allclose(got, expected, rtol=1e-10), f"refit stats differ for perm {perm}"
+    x_test = named(x2, names)
+    assert torch.allclose(refit.transform(x_test), reference.transform(x_test), rtol=1e-10)
