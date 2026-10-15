@@ -104,7 +104,7 @@ class DBaseScalerTensor:
             )
 
         # 3. Check for data and attribute "variable_names" consistency
-        channel_dim = self.set_channel_dim()
+        channel_dim = self.set_channel_dim(channels_last)
         data_channels = x.shape[channel_dim]
         attribute_channels = len(x_columns)
 
@@ -354,6 +354,276 @@ class DStandardScalerTensor(DBaseScalerTensor):
         current.var_x_ = combined_var + combined_var_corr
         current.n_ = self.n_ + other.n_
         return current
+
+
+def _as_int_tuple(v):
+    """Return ``v`` (list, tuple, int, or tensor, e.g. after ``read_scaler``) as a tuple of Python ints."""
+    if isinstance(v, torch.Tensor):
+        v = v.flatten().tolist()
+    elif isinstance(v, (int, np.integer)):
+        v = [v]
+    return tuple(int(i) for i in v)
+
+
+class DSpatialStandardScalerTensor(DBaseScalerTensor):
+    """
+    Distributed standard scaler for torch.Tensor with a separate mean and variance at every spatial location.
+
+    Where :class:`DStandardScalerTensor` keeps one mean/variance per channel, this scaler keeps one per
+    channel *and* per grid point of the ``spatial_dims`` axes (e.g. latitude x longitude, or
+    level x latitude x longitude). Every axis that is neither the channel axis nor a spatial axis (batch,
+    time, ...) is reduced. Statistics are NaN-aware per location: a NaN only removes that one value from
+    its location's count, so fixed-position missing data (e.g. SST over land) is handled correctly. A
+    location that is NaN in every sample gets ``n_ = 0`` and NaN mean/variance, and transforms to NaN.
+
+    Like the other distributed scalers it can be fit map-reduce style: fit one scaler per chunk and sum
+    them with ``+``, or call ``fit`` repeatedly on one scaler. Both use the elementwise Chan et al.
+    parallel mean/variance merge. Variances are population variances (divide by n).
+
+    Locations with zero variance (a constant field) are scaled with a standard deviation of 1, so
+    ``transform`` returns ``x - mean`` there instead of inf/NaN. Locations with NaN statistics stay NaN.
+
+    ``spatial_dims`` are interpreted in the scaler's own ``channels_last`` layout. If ``transform`` is
+    called with a ``channels_last`` override, the input is viewed in the scaler's layout (channel axis
+    moved) before the spatial axes are resolved, and the output is returned in the input's layout.
+
+    Attributes:
+        mean_x_ (torch.Tensor): per-location mean, shape ``(C, *spatial_shape_)``.
+        var_x_ (torch.Tensor): per-location population variance, shape ``(C, *spatial_shape_)``.
+        n_ (torch.Tensor): per-location count of non-NaN values, shape ``(C, *spatial_shape_)``.
+        spatial_shape_ (list[int]): sizes of the spatial axes at fit time.
+        spatial_dims (list[int]): the spatial axes, as given to ``__init__``.
+        x_columns_ (list): channel names (or integer indices when the input lacks ``variable_names``).
+
+    Args:
+        channels_last (bool): If True, the channel axis is the last axis. If False (default), it is axis 1.
+        spatial_dims (sequence of int): axes that get their own statistics, e.g. ``(-2, -1)`` for lat/lon
+            or ``(-3, -2, -1)`` for level/lat/lon. Negative values count from the end. They must be
+            distinct and must not include the channel axis.
+
+    Example:
+        Per-grid-point standardization of surface pressure in CREDIT's ``(B, C, T, H, W)`` layout,
+        reducing over batch and time::
+
+            import torch
+            from bridgescaler import DSpatialStandardScalerTensor
+
+            ps = torch.randn(8, 1, 2, 192, 288) * 1000 + 98000   # (batch, var, time, lat, lon)
+            ps.variable_names = ["PS"]
+            scaler = DSpatialStandardScalerTensor(channels_last=False, spatial_dims=(-2, -1))
+            scaler.fit(ps)                      # mean_x_ / var_x_ have shape (1, 192, 288)
+            ps_norm = scaler.transform(ps)
+            ps_back = scaler.inverse_transform(ps_norm)
+    """
+
+    def __init__(self, channels_last=False, spatial_dims=(-2, -1)):
+        self.mean_x_ = None
+        self.var_x_ = None
+        self.n_ = None
+        self.spatial_shape_ = None
+        self.spatial_dims = list(_as_int_tuple(spatial_dims))
+        super().__init__(channels_last=channels_last)
+
+    def _layout(self, ndim, channels_last=None):
+        """Resolve the positive channel axis and sorted positive spatial axes for an ``ndim``-D input.
+
+        Raises:
+            ValueError: if a spatial axis is out of range, repeated, or equal to the channel axis.
+        """
+        if channels_last is None:
+            channels_last = self.channels_last
+        channel_dim = ndim - 1 if channels_last else 1
+        raw = _as_int_tuple(self.spatial_dims)
+        if len(raw) == 0:
+            raise ValueError("spatial_dims must contain at least one axis.")
+        spatial = []
+        for d in raw:
+            if d < -ndim or d >= ndim:
+                raise ValueError(f"spatial_dims {list(raw)} out of range for a {ndim}-D input.")
+            spatial.append(d % ndim)
+        if len(set(spatial)) != len(spatial):
+            raise ValueError(f"spatial_dims {list(raw)} contain repeated axes for a {ndim}-D input.")
+        if channel_dim in spatial:
+            raise ValueError(
+                f"spatial_dims {list(raw)} include the channel axis ({channel_dim}) of a {ndim}-D input "
+                f"(channels_last={channels_last})."
+            )
+        return channel_dim, sorted(spatial)
+
+    def _check_spatial_shape(self, shape, what):
+        if self.spatial_shape_ is not None and tuple(shape) != _as_int_tuple(self.spatial_shape_):
+            raise ValueError(
+                f"{what} spatial shape {list(shape)} does not match the scaler's fitted spatial shape "
+                f"{list(_as_int_tuple(self.spatial_shape_))}."
+            )
+
+    @staticmethod
+    def _chan_merge(n_a, mean_a, var_a, n_b, mean_b, var_b):
+        """Elementwise Chan et al. merge of two sets of (count, mean, population variance).
+
+        Locations with a zero count on one side (all-NaN there) take the other side's statistics as-is, so
+        a NaN mean from an empty side does not poison a location that has data elsewhere.
+        """
+        n = n_a + n_b
+        delta = mean_b - mean_a
+        mean = mean_a + delta * (n_b / n)
+        var = (n_a * var_a + n_b * var_b) / n + n_a * n_b * delta ** 2 / n ** 2
+        a_empty = n_a == 0
+        b_empty = n_b == 0
+        mean = torch.where(a_empty, mean_b, torch.where(b_empty, mean_a, mean))
+        var = torch.where(a_empty, var_b, torch.where(b_empty, var_a, var))
+        return n, mean, var
+
+    def fit(self, x, weight=None):
+        """
+        Fit (or update) the per-location statistics with the data in ``x``.
+
+        Args:
+            x (torch.Tensor): input data containing the channel axis and the ``spatial_dims`` axes; all
+                other axes are reduced. Channel names are read from ``x.variable_names`` when present.
+            weight: accepted for API compatibility and ignored.
+
+        Raises:
+            ValueError: if ``spatial_dims`` is invalid for ``x``, or on a refit, if the channel count or
+                spatial shape differs from the fitted scaler.
+        """
+        x_columns, has_attribute = self.extract_x_columns(x, channels_last=self.channels_last)
+        channel_dim, spatial = self._layout(x.ndim)
+        spatial_shape = [int(x.shape[d]) for d in spatial]
+        rest = [d for d in range(x.ndim) if d != channel_dim and d not in spatial]
+        # (rest..., C, *S) -> (N, C, *S); one NaN-aware reduction over N.
+        xm = x.permute(*rest, channel_dim, *spatial).reshape(-1, x.shape[channel_dim], *spatial_shape)
+        new_mean, new_var, new_n = DStandardScalerTensor._nan_aware_stats(
+            xm, (0,), lambda stat, target: stat.unsqueeze(0))
+        if not self._fit:
+            self.x_columns_ = x_columns
+            self.spatial_shape_ = spatial_shape
+            self.mean_x_, self.var_x_, self.n_ = new_mean, new_var, new_n
+        else:
+            if x.shape[channel_dim] != len(self.x_columns_):
+                raise ValueError(
+                    f"New data has {x.shape[channel_dim]} channels but the scaler was fit with "
+                    f"{len(self.x_columns_)}."
+                )
+            self._check_spatial_shape(spatial_shape, "New data")
+            x_col_order = self.get_column_order(x_columns)
+            if x_col_order != list(range(len(x_col_order))):
+                # x_col_order[i] is the scaler index of input channel i; argsort maps scaler order -> input.
+                perm = torch.argsort(torch.tensor(x_col_order, device=new_mean.device))
+                new_mean = new_mean.index_select(0, perm)
+                new_var = new_var.index_select(0, perm)
+                new_n = new_n.index_select(0, perm)
+            dev = self.mean_x_.device
+            self.n_, self.mean_x_, self.var_x_ = self._chan_merge(
+                self.n_, self.mean_x_, self.var_x_, new_n.to(dev), new_mean.to(dev), new_var.to(dev))
+        self.spatial_dims = list(_as_int_tuple(self.spatial_dims))
+        self._fit = True
+
+    def _broadcast_scales(self, xv, x_col_order, channel_dim, spatial):
+        """Mean and std reshaped to broadcast against ``xv`` (already in the scaler's layout)."""
+        self._check_spatial_shape([xv.shape[d] for d in spatial], "Input")
+        mean, var = self.mean_x_, self.var_x_
+        if x_col_order != list(range(mean.shape[0])):
+            idx = torch.tensor(x_col_order, device=mean.device)
+            mean = mean.index_select(0, idx)
+            var = var.index_select(0, idx)
+        mean = mean.to(device=xv.device, dtype=xv.dtype)
+        var = var.to(device=xv.device, dtype=xv.dtype)
+        std = torch.where(var == 0, torch.ones_like(var), torch.sqrt(var))
+        # Stats are (C, *S) in that axis order; reorder to the input's axis order, then insert singleton axes.
+        kept = [channel_dim] + list(spatial)
+        perm = sorted(range(len(kept)), key=lambda i: kept[i])
+        view_shape = [xv.shape[d] if d in kept else 1 for d in range(xv.ndim)]
+        mean = mean.permute(*perm).reshape(view_shape)
+        std = std.permute(*perm).reshape(view_shape)
+        return mean, std
+
+    def _apply(self, x, channels_last, inverse):
+        xv, _, channels_last, channel_dim, x_col_order = self.process_x_for_transform(x, channels_last)
+        moved = channels_last != self.channels_last
+        if moved:
+            # View the input in the scaler's own layout so spatial_dims keep their meaning.
+            src = -1 if channels_last else 1
+            dst = -1 if self.channels_last else 1
+            xv = xv.movedim(src, dst)
+        native_channel_dim, spatial = self._layout(xv.ndim)
+        mean, std = self._broadcast_scales(xv, x_col_order, native_channel_dim, spatial)
+        out = xv * std + mean if inverse else (xv - mean) / std
+        if moved:
+            out = out.movedim(dst, src)
+        return self.package_transformed_x(out, x)
+
+    def transform(self, x, channels_last=None):
+        """
+        Standardize ``x`` per location: ``(x - mean) / std`` (``x - mean`` where the variance is 0).
+
+        Args:
+            x (torch.Tensor): input with the same spatial shape as the fitted data. Channels may be a
+                subset or reordering of the fitted channels when ``x.variable_names`` is set.
+            channels_last (bool): override the scaler's ``channels_last`` for this input.
+
+        Returns:
+            torch.Tensor: transformed data with the shape, dtype and device of ``x``. NaNs pass through.
+        """
+        return self._apply(x, channels_last, inverse=False)
+
+    def inverse_transform(self, x, channels_last=None):
+        """
+        Undo :meth:`transform`: ``x * std + mean`` per location (``x + mean`` where the variance is 0).
+
+        Args:
+            x (torch.Tensor): standardized input with the same spatial shape as the fitted data.
+            channels_last (bool): override the scaler's ``channels_last`` for this input.
+
+        Returns:
+            torch.Tensor: data in physical units with the shape, dtype and device of ``x``.
+        """
+        return self._apply(x, channels_last, inverse=True)
+
+    def get_scales(self, x_col_order=slice(None)):
+        """Return ``(mean_x_, var_x_)`` indexed along the channel axis, each shaped ``(C, *spatial_shape_)``."""
+        return self.mean_x_[x_col_order], self.var_x_[x_col_order]
+
+    def __add__(self, other):
+        current = deepcopy(self)
+
+        assert type(other) is DSpatialStandardScalerTensor, "Input is not DSpatialStandardScalerTensor."
+        assert current.is_fit() and other.is_fit(), "At least one scaler is not fit."
+        assert other.x_columns_ == self.x_columns_, "Scaler variables do not match."
+        if _as_int_tuple(other.spatial_shape_) != _as_int_tuple(self.spatial_shape_):
+            raise ValueError(
+                f"Scaler spatial shapes do not match: {list(_as_int_tuple(self.spatial_shape_))} vs "
+                f"{list(_as_int_tuple(other.spatial_shape_))}."
+            )
+        dev = self.mean_x_.device
+        current.n_, current.mean_x_, current.var_x_ = self._chan_merge(
+            self.n_, self.mean_x_, self.var_x_,
+            other.n_.to(dev), other.mean_x_.to(dev), other.var_x_.to(dev))
+        return current
+
+    def subset_columns(self, sel_columns):
+        """
+        Return a new scaler restricted to the channels in ``sel_columns`` (in that order).
+
+        Args:
+            sel_columns (list): channel names (or indices, for scalers fit without ``variable_names``).
+
+        Returns:
+            DSpatialStandardScalerTensor: a fitted copy with only the selected channels.
+        """
+        assert self._fit, "Scaler has not been fit."
+        idx = torch.tensor(self.get_column_order(list(sel_columns)), device=self.mean_x_.device)
+        new = DSpatialStandardScalerTensor(channels_last=self.channels_last, spatial_dims=self.spatial_dims)
+        new.mean_x_ = self.mean_x_.index_select(0, idx)
+        new.var_x_ = self.var_x_.index_select(0, idx)
+        new.n_ = self.n_.index_select(0, idx)
+        new.spatial_shape_ = list(_as_int_tuple(self.spatial_shape_))
+        new.x_columns_ = list(sel_columns)
+        new._fit = True
+        return new
+
+    def add_variables(self, other):
+        raise NotImplementedError("add_variables is not implemented for DSpatialStandardScalerTensor.")
 
 
 class DMinMaxScalerTensor(DBaseScalerTensor):

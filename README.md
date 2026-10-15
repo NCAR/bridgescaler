@@ -102,8 +102,8 @@ dss_combined.transform(x_1, channels_last=False)
 
 #### PyTorch Tensor Scalers
 If PyTorch (>= 2.0) is installed, tensor versions of the distributed scalers are available in
-`bridgescaler.distributed_tensor` (`DStandardScalerTensor`, `DMinMaxScalerTensor`,
-`DQuantileScalerTensor`). They operate directly on `torch.Tensor` inputs and run on CPU or GPU,
+`bridgescaler.distributed_tensor` (`DStandardScalerTensor`, `DSpatialStandardScalerTensor`,
+`DMinMaxScalerTensor`, `DQuantileScalerTensor`). They operate directly on `torch.Tensor` inputs and run on CPU or GPU,
 mirroring the numpy API (fit/transform/inverse_transform, summing to combine, and channels-last or
 channels-first layouts). Variable names are carried on a `variable_names` attribute of the tensor so
 subsets and reordering work as with pandas/xarray.
@@ -126,6 +126,24 @@ x = torch.rand(10000, 4)
 scaler = DQuantileScalerTensor(distribution="normal", fast_transform=True)
 x_transformed = scaler.fit_transform(x)
 x_restored = scaler.inverse_transform(x_transformed)
+```
+
+`DSpatialStandardScalerTensor` standardizes each grid point separately: it keeps a mean and
+variance per channel *and* per location along `spatial_dims` (default `(-2, -1)`, e.g. lat/lon;
+use `(-3, -2, -1)` for level/lat/lon), reducing over every other axis (batch, time, ...). Statistics
+are NaN-aware per location, merge with `+` or repeated `fit` calls like the other distributed scalers,
+and save/load with `save_scaler`/`load_scaler`. Locations with zero variance are only mean-centered.
+
+```python
+from bridgescaler import DSpatialStandardScalerTensor
+import torch
+
+ps = torch.randn(8, 1, 2, 192, 288) * 1000 + 98000  # (batch, variable, time, lat, lon)
+ps.variable_names = ["PS"]
+scaler = DSpatialStandardScalerTensor(channels_last=False, spatial_dims=(-2, -1))
+scaler.fit(ps)                         # mean_x_ and var_x_ have shape (1, 192, 288)
+ps_norm = scaler.transform(ps)
+ps_back = scaler.inverse_transform(ps_norm)
 ```
 
 ### Group Scaler

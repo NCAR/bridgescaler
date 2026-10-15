@@ -28,17 +28,7 @@ from .group import GroupStandardScaler, GroupRobustScaler, GroupMinMaxScaler
 from .deep import DeepStandardScaler, DeepMinMaxScaler, DeepQuantileTransformer
 from .distributed import (DStandardScaler, DMinMaxScaler, DQuantileScaler)
 
-# 3. Conditional Torch Imports
-if TORCH_AVAILABLE:
-    try: # Ensure that no errors are raised if PyTorch is installed but does not meet the required version.
-        from .distributed_tensor import (
-            DStandardScalerTensor,
-            DMinMaxScalerTensor,
-        )
-    except:
-        pass
-
-# 4. Define Public API
+# 3. Define Public API
 __all__ = [
     # Utilities
     "save_scaler", "load_scaler", "print_scaler", "read_scaler",
@@ -50,3 +40,15 @@ __all__ = [
     "DeepStandardScaler", "DeepMinMaxScaler", "DeepQuantileTransformer",
     "DStandardScaler", "DMinMaxScaler", "DQuantileScaler",
 ]
+
+# 4. Conditional Torch Imports (extend the public API)
+if TORCH_AVAILABLE:
+    try: # Ensure that no errors are raised if PyTorch is installed but does not meet the required version.
+        from .distributed_tensor import (
+            DStandardScalerTensor,
+            DSpatialStandardScalerTensor,
+            DMinMaxScalerTensor,
+        )
+        __all__ += ["DStandardScalerTensor", "DSpatialStandardScalerTensor", "DMinMaxScalerTensor"]
+    except:
+        pass

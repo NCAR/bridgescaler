@@ -1,5 +1,8 @@
-from bridgescaler import save_scaler, load_scaler
-from bridgescaler.distributed_tensor import DStandardScalerTensor, DMinMaxScalerTensor, DQuantileScalerTensor
+from bridgescaler import save_scaler, load_scaler, save_scaler_dict, load_scaler_dict
+from bridgescaler.distributed_tensor import (DStandardScalerTensor, DMinMaxScalerTensor, DQuantileScalerTensor,
+                                            DSpatialStandardScalerTensor)
+import time
+import warnings
 import copy
 import numpy as np
 import pytest
@@ -337,7 +340,7 @@ def test_tensor_scaler_with_attribute():
     #x_gpu.variable_names = ["ch1", "ch2", "ch3", "ch4", "ch5"]
 
     # collect scalers to test
-    scaler_objs = [DStandardScalerTensor, DMinMaxScalerTensor, DQuantileScalerTensor]
+    scaler_objs = [DStandardScalerTensor, DSpatialStandardScalerTensor, DMinMaxScalerTensor, DQuantileScalerTensor]
     for scaler_class in scaler_objs:
         print("test on: ",scaler_class.__name__)
 
@@ -499,3 +502,328 @@ def test_dquantile_tensor_compile_matches_eager():
         ie = eager.inverse_transform(te)
         ic = comp.inverse_transform(tc)
         assert torch.allclose(ie, ic, atol=1e-6, equal_nan=True), f"compiled inverse != eager for {dist}"
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# DSpatialStandardScalerTensor (per-grid-point standardization)
+# ---------------------------------------------------------------------------------------------------------------
+
+def _named(x, names):
+    """Attach variable_names to a tensor (slicing/cat drop the attribute) and return it."""
+    x.variable_names = list(names)
+    return x
+
+
+def make_spatial_test_data():
+    """Three chunks per layout with a spatially varying mean and std, so per-location stats are distinct."""
+    gen = torch.Generator().manual_seed(8675309)
+    n_examples = [40, 25, 7]
+    h, w, n_lev = 6, 9, 4
+    chans = ["t", "q", "ps"]
+    loc = torch.linspace(-3, 3, h * w, dtype=torch.float64).reshape(h, w)
+    base_mean = torch.tensor([280.0, 1e-3, 98000.0], dtype=torch.float64)
+    base_sd = torch.tensor([10.0, 1e-4, 1500.0], dtype=torch.float64)
+    mean_hw = base_mean[:, None, None] * (1 + 0.05 * loc)          # (C, H, W)
+    sd_hw = base_sd[:, None, None] * (1.5 + torch.sin(loc))        # (C, H, W), > 0
+    lev = torch.arange(1, n_lev + 1, dtype=torch.float64)[:, None, None]
+    data = {"chans": chans, "2d": [], "3d": [], "credit": [], "h": h, "w": w, "n_lev": n_lev}
+    for n in n_examples:
+        # 2-D spatial: (B, C, H, W)
+        data["2d"].append(torch.randn(n, 3, h, w, generator=gen, dtype=torch.float64) * sd_hw + mean_hw)
+        # 3-D spatial: (B, C, L, H, W)
+        data["3d"].append(torch.randn(n, 3, n_lev, h, w, generator=gen, dtype=torch.float64)
+                          * (sd_hw[:, None] * lev) + mean_hw[:, None] * lev)
+        # CREDIT layout: (B, L, T, H, W) with the level/variable axis as the channel (dim 1), T=2
+        data["credit"].append(torch.randn(n, n_lev, 2, h, w, generator=gen, dtype=torch.float64)
+                              * (sd_hw[0] * lev)[:, None] + (mean_hw[0] * lev)[:, None])
+    return data
+
+
+spatial_test_data = make_spatial_test_data()
+
+_SPATIAL_CASES = [
+    # (data key, spatial_dims, reduced dims of the concatenated tensor, channel names)
+    ("2d", (-2, -1), (0,), ["t", "q", "ps"]),
+    ("3d", (-3, -2, -1), (0,), ["t", "q", "ps"]),
+    ("credit", (-2, -1), (0, 2), [f"lev{i}" for i in range(spatial_test_data["n_lev"])]),
+]
+
+
+@pytest.mark.parametrize("key,spatial_dims,reduce_dims,names", _SPATIAL_CASES)
+def test_dspatial_standard_scaler_stats(key, spatial_dims, reduce_dims, names):
+    chunks = spatial_test_data[key]
+    all_x = torch.cat(chunks, dim=0)
+    true_mean = all_x.mean(dim=reduce_dims)
+    true_var = all_x.var(dim=reduce_dims, unbiased=False)
+
+    # 1. Separate scalers per chunk merged with +.
+    scalers = []
+    for c in chunks:
+        s = DSpatialStandardScalerTensor(channels_last=False, spatial_dims=spatial_dims)
+        s.fit(_named(c.clone(), names))
+        scalers.append(s)
+    total = scalers[0] + scalers[1] + scalers[2]
+    # 2. Sequential fits on one scaler.
+    seq = DSpatialStandardScalerTensor(channels_last=False, spatial_dims=spatial_dims)
+    for c in chunks:
+        seq.fit(_named(c.clone(), names))
+
+    for s in (total, seq):
+        mean, var = s.get_scales()
+        assert mean.shape == true_mean.shape and var.shape == true_var.shape == s.n_.shape
+        assert list(s.spatial_shape_) == list(true_mean.shape[1:])
+        torch.testing.assert_close(mean, true_mean, rtol=1e-5, atol=0)
+        torch.testing.assert_close(var, true_var, rtol=1e-5, atol=0)
+        n_expected = all_x.numel() / true_mean.numel()
+        assert torch.all(s.n_ == n_expected)
+    # Stats are genuinely per location (not collapsed to one per channel).
+    assert torch.unique(total.mean_x_[0]).numel() > 1
+
+    # Round trip and normalized output statistics.
+    x = _named(all_x.clone(), names)
+    xt = total.transform(x)
+    torch.testing.assert_close(xt.mean(dim=reduce_dims), torch.zeros_like(true_mean), atol=1e-8, rtol=0)
+    torch.testing.assert_close(xt.var(dim=reduce_dims, unbiased=False), torch.ones_like(true_var),
+                               rtol=1e-6, atol=0)
+    torch.testing.assert_close(total.inverse_transform(xt), all_x, rtol=1e-10, atol=1e-10)
+
+
+def test_dspatial_standard_scaler_nan_handling():
+    torch.manual_seed(1)
+    x = torch.randn(50, 2, 4, 5, dtype=torch.float64) * 3 + 10
+    x[:20, 0, 1, 2] = float("nan")       # fixed location, partially missing
+    x[:, 1, 3, 4] = float("nan")         # fixed location, missing everywhere
+    x[7, 0, 0, 0] = float("nan")         # one random missing value
+    _named(x, ["a", "b"])
+    s = DSpatialStandardScalerTensor()
+    s.fit(x)
+
+    n_expected = torch.full((2, 4, 5), 50.0, dtype=torch.float64)
+    n_expected[0, 1, 2] = 30
+    n_expected[1, 3, 4] = 0
+    n_expected[0, 0, 0] = 49
+    assert torch.equal(s.n_, n_expected)
+
+    # Partially missing location matches stats of the stripped values.
+    vals = x[20:, 0, 1, 2]
+    assert torch.isclose(s.mean_x_[0, 1, 2], vals.mean())
+    assert torch.isclose(s.var_x_[0, 1, 2], vals.var(unbiased=False))
+    # All-NaN location: NaN stats, no crash; other locations finite.
+    assert torch.isnan(s.mean_x_[1, 3, 4]) and torch.isnan(s.var_x_[1, 3, 4])
+    finite_mask = n_expected > 0
+    assert torch.isfinite(s.mean_x_[finite_mask]).all() and torch.isfinite(s.var_x_[finite_mask]).all()
+
+    # NaNs pass through transform; everything else is finite. The all-NaN location transforms to NaN.
+    xt = s.transform(x)
+    assert torch.equal(torch.isnan(xt), torch.isnan(x))
+    clean = _named(torch.ones(3, 2, 4, 5, dtype=torch.float64), ["a", "b"])
+    out = s.transform(clean)
+    assert torch.isnan(out[:, 1, 3, 4]).all()
+    out[:, 1, 3, 4] = 0
+    assert torch.isfinite(out).all()
+
+    # Merging a chunk that is all-NaN at a location with one that has data must not poison that location.
+    y = torch.randn(10, 2, 4, 5, dtype=torch.float64)
+    s2 = DSpatialStandardScalerTensor()
+    s2.fit(_named(y.clone(), ["a", "b"]))
+    merged = s + s2
+    assert torch.allclose(merged.mean_x_[1, 3, 4], y[:, 1, 3, 4].mean())
+    assert merged.n_[1, 3, 4] == 10
+
+
+def test_dspatial_standard_scaler_layouts_and_reordering():
+    torch.manual_seed(2)
+    names = ["c0", "c1", "c2"]
+    x_cf = _named(torch.randn(12, 3, 2, 5, 6, dtype=torch.float64) * 4 + 1, names)  # (B, C, T, H, W)
+    s_cf = DSpatialStandardScalerTensor(channels_last=False, spatial_dims=(-2, -1))
+    s_cf.fit(x_cf)
+
+    # Same data channels-last: (B, T, H, W, C) with spatial axes (-3, -2).
+    x_cl = _named(x_cf.permute(0, 2, 3, 4, 1).contiguous(), names)
+    s_cl = DSpatialStandardScalerTensor(channels_last=True, spatial_dims=(-3, -2))
+    s_cl.fit(x_cl)
+    torch.testing.assert_close(s_cl.mean_x_, s_cf.mean_x_)
+    torch.testing.assert_close(s_cl.var_x_, s_cf.var_x_)
+    torch.testing.assert_close(s_cl.transform(x_cl).permute(0, 4, 1, 2, 3), s_cf.transform(x_cf))
+
+    # channels_last override at transform time: spatial_dims keep their meaning in the scaler's layout.
+    out_override = s_cf.transform(x_cl, channels_last=True)
+    assert out_override.shape == x_cl.shape
+    torch.testing.assert_close(out_override.permute(0, 4, 1, 2, 3), s_cf.transform(x_cf))
+    torch.testing.assert_close(s_cf.inverse_transform(out_override, channels_last=True), x_cl)
+
+    # Channel reordering (3-cycle) and subsets via variable_names.
+    perm = [2, 0, 1]
+    x_perm = _named(x_cf[:, perm].clone(), [names[i] for i in perm])
+    torch.testing.assert_close(s_cf.transform(x_perm), s_cf.transform(x_cf)[:, perm])
+    x_sub = _named(x_cf[:, [2]].clone(), ["c2"])
+    torch.testing.assert_close(s_cf.transform(x_sub), s_cf.transform(x_cf)[:, [2]])
+    assert s_cf.transform(x_sub).variable_names == ["c2"]
+
+    # Refit with permuted channel order gives the same stats as refitting in the original order.
+    s_a = copy.deepcopy(s_cf)
+    s_a.fit(_named(x_cf.clone() * 2, names))
+    s_b = copy.deepcopy(s_cf)
+    s_b.fit(_named((x_cf * 2)[:, perm].clone(), [names[i] for i in perm]))
+    torch.testing.assert_close(s_a.mean_x_, s_b.mean_x_)
+    torch.testing.assert_close(s_a.var_x_, s_b.var_x_)
+    torch.testing.assert_close(s_a.n_, s_b.n_)
+
+    # subset_columns
+    sub = s_cf.subset_columns(["c2", "c0"])
+    assert sub.x_columns_ == ["c2", "c0"] and sub.mean_x_.shape == (2, 5, 6)
+    torch.testing.assert_close(sub.mean_x_, s_cf.mean_x_[[2, 0]])
+    x_sub2 = _named(x_cf[:, [2, 0]].clone(), ["c2", "c0"])
+    torch.testing.assert_close(sub.transform(x_sub2), s_cf.transform(x_sub2))
+    with pytest.raises(NotImplementedError):
+        s_cf.add_variables(sub)
+
+
+def test_dspatial_standard_scaler_errors():
+    names = ["a", "b"]
+    x = _named(torch.randn(5, 2, 4, 6), names)
+    s = DSpatialStandardScalerTensor()
+    s.fit(x)
+    wrong = _named(torch.randn(5, 2, 4, 7), names)
+    with pytest.raises(ValueError, match="spatial shape"):
+        s.fit(wrong)
+    with pytest.raises(ValueError, match="spatial shape"):
+        s.transform(wrong)
+    with pytest.raises(ValueError, match="spatial shape"):
+        s.inverse_transform(wrong)
+    s_wrong = DSpatialStandardScalerTensor()
+    s_wrong.fit(wrong)
+    with pytest.raises(ValueError, match="spatial shapes do not match"):
+        s + s_wrong
+    with pytest.raises(AssertionError, match="not DSpatialStandardScalerTensor"):
+        s + DStandardScalerTensor(channels_last=False)
+    with pytest.raises(ValueError, match="channels"):
+        s.fit(_named(torch.randn(5, 3, 4, 6), ["a", "b", "c"]))
+
+    # Invalid spatial_dims: channel axis, repeated axis, out of range.
+    for bad in [(1, -1), (-1, 3), (-2, 4), (-5, -1)]:
+        with pytest.raises(ValueError, match="spatial_dims"):
+            DSpatialStandardScalerTensor(spatial_dims=bad).fit(x)
+    with pytest.raises(ValueError, match="channel axis"):
+        DSpatialStandardScalerTensor(channels_last=True, spatial_dims=(-2, -1)).fit(
+            _named(torch.randn(5, 4, 6, 2), names))
+
+
+def test_dspatial_standard_scaler_serialization(tmp_path):
+    torch.manual_seed(3)
+    x = _named(torch.randn(10, 2, 3, 4, 5, dtype=torch.float64) * 7 + 2, ["u", "v"])
+    s = DSpatialStandardScalerTensor(channels_last=False, spatial_dims=(-3, -2, -1))
+    s.fit(x)
+    expected = s.transform(x)
+
+    path = tmp_path / "spatial_scaler.json"
+    save_scaler(s, path)
+    loaded = load_scaler(path)
+    dict_path = tmp_path / "spatial_scaler_dict.json"
+    save_scaler_dict({"input": {"grid": {"uv": s}}}, dict_path)
+    loaded_dict = load_scaler_dict(dict_path)["input"]["grid"]["uv"]
+
+    for ld in (loaded, loaded_dict):
+        assert type(ld) is DSpatialStandardScalerTensor
+        assert ld.is_fit() and ld.channels_last is False and ld.x_columns_ == ["u", "v"]
+        for attr in ("mean_x_", "var_x_", "n_"):
+            assert torch.equal(getattr(ld, attr), getattr(s, attr))
+        torch.testing.assert_close(ld.transform(x), expected, rtol=0, atol=0)
+        torch.testing.assert_close(ld.inverse_transform(expected), s.inverse_transform(expected), rtol=0, atol=0)
+        # Loaded scalers keep working for refits and merges.
+        ld2 = ld + s
+        torch.testing.assert_close(ld2.mean_x_, s.mean_x_)
+        ld.fit(x)
+        torch.testing.assert_close(ld.var_x_, s.var_x_)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_dspatial_standard_scaler_dtypes(dtype):
+    torch.manual_seed(4)
+    x = _named((torch.randn(30, 2, 6, 8) * 50 + 1000).to(dtype), ["a", "b"])
+    s = DSpatialStandardScalerTensor()
+    s.fit(x)
+    assert s.mean_x_.dtype == dtype
+    out = s.transform(x)
+    assert out.dtype == dtype
+    tol = 1e-4 if dtype == torch.float32 else 1e-10
+    torch.testing.assert_close(s.inverse_transform(out), x, rtol=tol, atol=tol * 1000)
+    # Stats of one dtype applied to input of another: output follows the input dtype.
+    other = torch.float64 if dtype == torch.float32 else torch.float32
+    assert s.transform(_named(x.to(other), ["a", "b"])).dtype == other
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_dspatial_standard_scaler_cuda():
+    torch.manual_seed(5)
+    x_cpu = torch.randn(16, 2, 6, 8)
+    x_gpu = _named(x_cpu.to("cuda"), ["a", "b"])
+    s = DSpatialStandardScalerTensor()
+    s.fit(x_gpu)
+    assert s.mean_x_.is_cuda
+    out = s.transform(x_gpu)
+    assert out.is_cuda
+    out_cpu = s.transform(_named(x_cpu.clone(), ["a", "b"]))
+    assert not out_cpu.is_cuda
+    torch.testing.assert_close(out.cpu(), out_cpu)
+    torch.testing.assert_close(s.inverse_transform(out), x_gpu)
+
+
+def test_dspatial_standard_scaler_matches_flattened_standard_scaler():
+    """The new class reproduces what CREDIT does today: a DStandardScalerTensor on the flattened (B, H*W) grid."""
+    torch.manual_seed(6)
+    b, h, w = 40, 12, 16
+    x = torch.randn(b, 1, 1, h, w, dtype=torch.float64) * torch.linspace(1, 5, h * w).reshape(h, w) + 1000
+    names = ["PS"]
+    spatial = DSpatialStandardScalerTensor(channels_last=False, spatial_dims=(-2, -1))
+    spatial.fit(_named(x.clone(), names))
+    flat = DStandardScalerTensor(channels_last=False)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        flat.fit(x.reshape(b, h * w))
+        expected = flat.transform(x.reshape(b, h * w)).reshape(b, 1, 1, h, w)
+    torch.testing.assert_close(spatial.mean_x_.reshape(-1), flat.mean_x_)
+    torch.testing.assert_close(spatial.var_x_.reshape(-1), flat.var_x_)
+    torch.testing.assert_close(spatial.transform(_named(x.clone(), names)), expected, rtol=1e-12, atol=1e-12)
+
+
+def test_dspatial_standard_scaler_zero_variance():
+    torch.manual_seed(7)
+    x = torch.randn(20, 1, 3, 4, dtype=torch.float64) + 5
+    x[:, 0, 1, 1] = 3.25  # constant location
+    s = DSpatialStandardScalerTensor()
+    s.fit(_named(x.clone(), ["a"]))
+    assert s.var_x_[0, 1, 1] == 0
+    probe = _named(torch.full((2, 1, 3, 4), 4.0, dtype=torch.float64), ["a"])
+    out = s.transform(probe)
+    assert torch.isfinite(out).all()
+    assert torch.all(out[:, 0, 1, 1] == 4.0 - 3.25)
+    torch.testing.assert_close(s.inverse_transform(out), probe)
+
+
+def test_dspatial_standard_scaler_speed():
+    """Informational timing (not asserted): new class vs CREDIT's flattened DStandardScalerTensor."""
+    torch.manual_seed(8)
+    h, w = 192, 288
+    fit_x = torch.randn(8, 1, 1, h, w) * 1000 + 98000
+    x = torch.randn(1, 1, 1, h, w) * 1000 + 98000
+    spatial = DSpatialStandardScalerTensor(channels_last=False, spatial_dims=(-2, -1))
+    spatial.fit(_named(fit_x.clone(), ["PS"]))
+    flat = DStandardScalerTensor(channels_last=False)
+    x_flat = x.reshape(1, h * w)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        flat.fit(fit_x.reshape(8, h * w))
+        x_named = _named(x.clone(), ["PS"])
+
+        def bench(fn, reps=50):
+            fn()
+            t0 = time.perf_counter()
+            for _ in range(reps):
+                fn()
+            return (time.perf_counter() - t0) / reps * 1e3
+
+        t_spatial = bench(lambda: spatial.transform(x_named))
+        t_flat = bench(lambda: flat.transform(x_flat))
+    print(f"\ntransform (1,1,1,{h},{w}): DSpatialStandardScalerTensor {t_spatial:.3f} ms, "
+          f"flattened DStandardScalerTensor {t_flat:.3f} ms ({t_flat / t_spatial:.1f}x)")
