@@ -365,7 +365,7 @@ def _as_int_tuple(v):
     return tuple(int(i) for i in v)
 
 
-class DStandardSpatialScalerTensor(DBaseScalerTensor):
+class DSpatialStandardScalerTensor(DBaseScalerTensor):
     """
     Distributed standard scaler for torch.Tensor with a separate mean and variance at every spatial location.
 
@@ -406,11 +406,11 @@ class DStandardSpatialScalerTensor(DBaseScalerTensor):
         reducing over batch and time::
 
             import torch
-            from bridgescaler import DStandardSpatialScalerTensor
+            from bridgescaler import DSpatialStandardScalerTensor
 
             ps = torch.randn(8, 1, 2, 192, 288) * 1000 + 98000   # (batch, var, time, lat, lon)
             ps.variable_names = ["PS"]
-            scaler = DStandardSpatialScalerTensor(channels_last=False, spatial_dims=(-2, -1))
+            scaler = DSpatialStandardScalerTensor(channels_last=False, spatial_dims=(-2, -1))
             scaler.fit(ps)                      # mean_x_ / var_x_ have shape (1, 192, 288)
             ps_norm = scaler.transform(ps)
             ps_back = scaler.inverse_transform(ps_norm)
@@ -587,7 +587,7 @@ class DStandardSpatialScalerTensor(DBaseScalerTensor):
     def __add__(self, other):
         current = deepcopy(self)
 
-        assert type(other) is DStandardSpatialScalerTensor, "Input is not DStandardSpatialScalerTensor."
+        assert type(other) is DSpatialStandardScalerTensor, "Input is not DSpatialStandardScalerTensor."
         assert current.is_fit() and other.is_fit(), "At least one scaler is not fit."
         assert other.x_columns_ == self.x_columns_, "Scaler variables do not match."
         if _as_int_tuple(other.spatial_shape_) != _as_int_tuple(self.spatial_shape_):
@@ -609,11 +609,11 @@ class DStandardSpatialScalerTensor(DBaseScalerTensor):
             sel_columns (list): channel names (or indices, for scalers fit without ``variable_names``).
 
         Returns:
-            DStandardSpatialScalerTensor: a fitted copy with only the selected channels.
+            DSpatialStandardScalerTensor: a fitted copy with only the selected channels.
         """
         assert self._fit, "Scaler has not been fit."
         idx = torch.tensor(self.get_column_order(list(sel_columns)), device=self.mean_x_.device)
-        new = DStandardSpatialScalerTensor(channels_last=self.channels_last, spatial_dims=self.spatial_dims)
+        new = DSpatialStandardScalerTensor(channels_last=self.channels_last, spatial_dims=self.spatial_dims)
         new.mean_x_ = self.mean_x_.index_select(0, idx)
         new.var_x_ = self.var_x_.index_select(0, idx)
         new.n_ = self.n_.index_select(0, idx)
@@ -623,7 +623,7 @@ class DStandardSpatialScalerTensor(DBaseScalerTensor):
         return new
 
     def add_variables(self, other):
-        raise NotImplementedError("add_variables is not implemented for DStandardSpatialScalerTensor.")
+        raise NotImplementedError("add_variables is not implemented for DSpatialStandardScalerTensor.")
 
 
 class DMinMaxScalerTensor(DBaseScalerTensor):

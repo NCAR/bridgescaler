@@ -46,9 +46,9 @@ if TORCH_AVAILABLE:
     try: # Ensure that no errors are raised if PyTorch is installed but does not meet the required version.
         from .distributed_tensor import (
             DStandardScalerTensor,
-            DStandardSpatialScalerTensor,
+            DSpatialStandardScalerTensor,
             DMinMaxScalerTensor,
         )
-        __all__ += ["DStandardScalerTensor", "DStandardSpatialScalerTensor", "DMinMaxScalerTensor"]
+        __all__ += ["DStandardScalerTensor", "DSpatialStandardScalerTensor", "DMinMaxScalerTensor"]
     except:
         pass

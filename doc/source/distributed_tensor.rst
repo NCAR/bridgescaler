@@ -45,7 +45,7 @@ Functions in ``bridgescaler.backend`` module all support distributed scalers for
 
 Per-location standardization
 ----------------------------
-``DStandardSpatialScalerTensor`` keeps a separate mean and variance for every channel *and* every
+``DSpatialStandardScalerTensor`` keeps a separate mean and variance for every channel *and* every
 grid point along ``spatial_dims`` (default ``(-2, -1)``, e.g. latitude x longitude; use
 ``(-3, -2, -1)`` for level x latitude x longitude). All other axes (batch, time, ...) are reduced.
 The statistics ``mean_x_``, ``var_x_`` and ``n_`` have shape ``(C, *spatial_shape_)``.
@@ -62,7 +62,7 @@ Example (CREDIT-style ``(batch, variable, time, lat, lon)`` tensors):
 
 .. code-block:: python
 
-    from bridgescaler import DStandardSpatialScalerTensor, save_scaler, load_scaler
+    from bridgescaler import DSpatialStandardScalerTensor, save_scaler, load_scaler
     import torch
 
     x_1 = torch.randn(8, 1, 2, 192, 288) * 1000 + 98000
@@ -70,8 +70,8 @@ Example (CREDIT-style ``(batch, variable, time, lat, lon)`` tensors):
     x_1.variable_names = ["PS"]
     x_2.variable_names = ["PS"]
 
-    dss_1 = DStandardSpatialScalerTensor(channels_last=False, spatial_dims=(-2, -1))
-    dss_2 = DStandardSpatialScalerTensor(channels_last=False, spatial_dims=(-2, -1))
+    dss_1 = DSpatialStandardScalerTensor(channels_last=False, spatial_dims=(-2, -1))
+    dss_2 = DSpatialStandardScalerTensor(channels_last=False, spatial_dims=(-2, -1))
     dss_1.fit(x_1)
     dss_2.fit(x_2)
     dss_combined = dss_1 + dss_2      # mean_x_.shape == (1, 192, 288)
