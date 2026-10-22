@@ -149,6 +149,26 @@ class DBaseScalerTensor:
         x_in_col_indices = [col_index[item] for item in x_in_columns]
         return x_in_col_indices
 
+    def get_fit_column_order(self, x_in_columns):
+        """
+        Get the indices that reorder the channels of an input x into the scaler's column order, for refitting.
+
+        ``get_column_order`` maps each *input* channel to its *scaler* index, which is what selecting stats for
+        transform needs. Reordering the input itself needs the inverse permutation: entry ``j`` is the input channel
+        holding scaler column ``j``. The two only coincide when the reordering is its own inverse (e.g. a single swap).
+
+        Args:
+            x_in_columns (list): list of input variable names, the same set as the scaler's x_columns_.
+
+        Returns:
+            x_in_col_indices (list): integer indices of the input channels in scaler column order.
+        """
+        x_col_order = self.get_column_order(x_in_columns)
+        x_in_col_indices = [0] * len(x_col_order)
+        for in_index, scaler_index in enumerate(x_col_order):
+            x_in_col_indices[scaler_index] = in_index
+        return x_in_col_indices
+
 
     @staticmethod
     def package_transformed_x(x_transformed, x):
@@ -273,7 +293,7 @@ class DStandardScalerTensor(DBaseScalerTensor):
             assert (
                     x.shape[channel_dim] == len(self.x_columns_)
             ), "New data has a different number of variables."
-            x_col_order = self.get_column_order(x_columns)
+            x_col_order = self.get_fit_column_order(x_columns)
             sub = xv[..., x_col_order] if self.channels_last else xv[:, x_col_order]
             new_mean, new_var, new_n = self._nan_aware_stats(sub, reduce_dims, reshape_fn)
             combined_mean = (self.n_ * self.mean_x_ + new_n * new_mean) / (
@@ -663,7 +683,7 @@ class DMinMaxScalerTensor(DBaseScalerTensor):
             assert (
                     x.shape[channel_dim] == len(self.x_columns_)
             ), "New data has a different number of variables."
-            x_col_order = self.get_column_order(x_columns)
+            x_col_order = self.get_fit_column_order(x_columns)
             if self.channels_last:
                 self.max_x_ = torch.maximum(
                     self.max_x_, torch.amax(xv_for_max[...,x_col_order], dim=tuple(range(xv.ndim - 1)))
