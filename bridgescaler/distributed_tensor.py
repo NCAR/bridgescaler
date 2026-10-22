@@ -8,7 +8,7 @@ import weakref
 from copy import deepcopy
 from functools import partial
 
-from crick import TDigest as CTDigest
+from .tdigest import TDigest as CTDigest
 import numpy as np
 from numpy.lib.recfunctions import structured_to_unstructured, unstructured_to_structured
 CENTROID_DTYPE = np.dtype([('mean', np.float64), ('weight', np.float64)])
@@ -757,7 +757,7 @@ def pchip_eval_tensor(x_knots, z_knots, m_knots, xv):
 
 class DQuantileScalerTensor(DBaseScalerTensor):
     """
-    Distributed Quantile Scaler for tensors that uses the crick TDigest Cython library to compute quantiles across multiple
+    Distributed Quantile Scaler for tensors that uses a TDigest (a numba port of the crick library) to compute quantiles across multiple
     datasets in parallel. The library can perform fitting, transforms, and inverse transforms.
 
     DQuantileScaler supports

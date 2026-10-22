@@ -1,7 +1,7 @@
-"""Benchmark DQuantileScaler (numpy/crick) vs DQuantileScalerTensor (torch) transform runtimes.
+"""Benchmark DQuantileScaler (numpy/numba) vs DQuantileScalerTensor (torch) transform runtimes.
 
 Compares `transform` wall-clock time across total array sizes 1e3 .. 1e6 (powers of 10) for:
-  * DQuantileScaler          - numpy/crick, CPU
+  * DQuantileScaler          - numpy/numba, CPU
   * DQuantileScalerTensor    - torch, CPU (eager)
   * DQuantileScalerTensor    - torch, GPU (eager)
   * DQuantileScalerTensor    - torch, GPU (torch.compile)   [if CUDA available]

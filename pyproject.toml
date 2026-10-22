@@ -22,7 +22,6 @@ dependencies = [
     "scikit-learn>=1.0",
     "numpy",
     "pandas",
-    "crick",
     "scipy",
     "xarray",
     "numba",
@@ -40,6 +39,8 @@ develop = ["sphinx",
            "pre-commit",
            "pytest"
 ]
+# crick is only needed to cross-check the bundled TDigest port against the original library in the tests.
+test-crick = ["crick"]
 [project.urls]
 Homepage = "https://github.com/NCAR/bridgescaler"
 

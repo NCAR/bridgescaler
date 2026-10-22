@@ -1,7 +1,7 @@
 import numpy as np
 from numpy.lib.recfunctions import structured_to_unstructured, unstructured_to_structured
 from copy import deepcopy
-from crick import TDigest as CTDigest
+from .tdigest import TDigest as CTDigest
 from scipy.special import ndtr, ndtri
 import pandas as pd
 import xarray as xr
@@ -501,7 +501,7 @@ def tdigest_quantile(qv, cent_mean, cent_weight, t_min, t_max, out):
 
 class DQuantileScaler(DBaseScaler):
     """
-    Distributed Quantile Scaler that uses the crick TDigest Cython library to compute quantiles across multiple
+    Distributed Quantile Scaler that uses a TDigest (a numba port of the crick library) to compute quantiles across multiple
     datasets in parallel. The library can perform fitting, transforms, and inverse transforms across variables
     in parallel using the multiprocessing library. Multidimensional arrays are stored in shared memory across
     processes to minimize inter-process communication.

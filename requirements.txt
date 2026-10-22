@@ -1,7 +1,6 @@
 pandas
 numpy
 scikit-learn>=1.0
-crick
 xarray
 scipy
 numba
