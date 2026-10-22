@@ -146,6 +146,94 @@ def test_dstandard_scaler_nan_aware():
     assert not torch.isnan(out[1, 1]), "clean value in the same channel should transform normally"
 
 
+def test_dstandard_scaler_merge_masked_channel():
+    # A channel can be entirely absent from one batch and present in the next (seasonal sea ice in a
+    # per-gridpoint fit, say). Merging must pick up whichever side has data instead of letting the
+    # empty side's NaN mean/var through: n=0 does not mask it out on its own, because 0 * nan is nan.
+    torch.manual_seed(0)
+    n = 400
+    names = ["always", "seasonal", "never"]
+
+    def make_batch(seasonal_valid):
+        always = torch.randn(n, dtype=torch.float64) * 3 + 10
+        seasonal = (
+            torch.randn(n, dtype=torch.float64) * 2 + 270
+            if seasonal_valid
+            else torch.full((n,), float("nan"), dtype=torch.float64)
+        )
+        never = torch.full((n,), float("nan"), dtype=torch.float64)
+        x = torch.stack([always, seasonal, never], dim=1)
+        x.variable_names = list(names)
+        return x
+
+    masked = make_batch(seasonal_valid=False)  # "seasonal" fully NaN here
+    valid = make_batch(seasonal_valid=True)
+
+    # Ground truth: a single fit over both batches' samples at once.
+    both = torch.cat([masked, valid], dim=0)
+    both.variable_names = list(names)
+    oracle = DStandardScalerTensor(channels_last=True)
+    oracle.fit(both)
+    o_mean, o_var = oracle.get_scales()
+
+    def check(scaler, label):
+        mean, var = scaler.get_scales()
+        for name in ("always", "seasonal"):
+            i = scaler.x_columns_.index(name)
+            assert torch.isfinite(mean[i]), f"{label}: '{name}' mean went non-finite"
+            assert torch.isfinite(var[i]), f"{label}: '{name}' var went non-finite"
+            assert torch.isclose(mean[i], o_mean[i], atol=1e-8), \
+                f"{label}: '{name}' mean does not match a single fit over both batches"
+            assert torch.isclose(var[i], o_var[i], atol=1e-8), \
+                f"{label}: '{name}' var does not match a single fit over both batches"
+            assert scaler.n_[i] == oracle.n_[i], f"{label}: '{name}' count does not match"
+        # Observed nowhere, so there is no mean to report.
+        j = scaler.x_columns_.index("never")
+        assert torch.isnan(mean[j]) and torch.isnan(var[j]), \
+            f"{label}: a channel empty in every batch should stay NaN"
+        assert scaler.n_[j] == 0, f"{label}: 'never' count should be zero"
+
+    # __add__ (the map-reduce path: per-rank or per-file fits summed together).
+    sa = DStandardScalerTensor(channels_last=True)
+    sa.fit(masked)
+    sb = DStandardScalerTensor(channels_last=True)
+    sb.fit(valid)
+    check(sa + sb, "masked + valid")
+    check(sb + sa, "valid + masked")
+
+    # Repeated fit() on one scaler (the running-average path), in both orders.
+    for first, second, label in ((masked, valid, "fit(masked), fit(valid)"),
+                                 (valid, masked, "fit(valid), fit(masked)")):
+        running = DStandardScalerTensor(channels_last=True)
+        running.fit(first)
+        running.fit(second)
+        check(running, label)
+
+
+def test_dstandard_scaler_merge_unchanged_without_masking():
+    # Regression guard for the merge refactor: with data on both sides the combined moments must be
+    # exactly the original expression, bit for bit, not merely close to it.
+    torch.manual_seed(1)
+    x_a = torch.randn(300, 4, dtype=torch.float64) * 5 + 2
+    x_b = torch.randn(150, 4, dtype=torch.float64) * 5 + 2
+
+    sa = DStandardScalerTensor(channels_last=True)
+    sa.fit(x_a)
+    sb = DStandardScalerTensor(channels_last=True)
+    sb.fit(x_b)
+    n_a, mean_a, var_a = sa.n_, sa.mean_x_, sa.var_x_
+    n_b, mean_b, var_b = sb.n_, sb.mean_x_, sb.var_x_
+
+    expected_mean = (n_a * mean_a + n_b * mean_b) / (n_a + n_b)
+    expected_var = ((n_a * var_a + n_b * var_b) / (n_a + n_b)
+                    + (n_a * n_b * (mean_a - mean_b) ** 2) / ((n_a + n_b) ** 2))
+
+    merged = sa + sb
+    assert torch.equal(merged.mean_x_, expected_mean), "merged mean changed for unmasked data"
+    assert torch.equal(merged.var_x_, expected_var), "merged var changed for unmasked data"
+    assert torch.equal(merged.n_, n_a + n_b)
+
+
 def test_dminmax_scaler_nan_aware():
     torch.manual_seed(1)
     n = 5000
