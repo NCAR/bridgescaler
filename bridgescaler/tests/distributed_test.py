@@ -4,6 +4,8 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 import os
+import warnings
+from copy import deepcopy
 from multiprocessing import Pool
 
 def make_test_data():
@@ -123,6 +125,111 @@ def test_dminmax_scaler():
     assert min_4d.shape[0] == n_cols and max_4d.shape[0] == n_cols, "Stat shape mismatch"
     assert np.max(np.abs(min_2d - all_ds_2d.min(axis=0))) < 1e-8, "significant difference in means"
     assert np.max(np.abs(max_2d - all_ds_2d.max(axis=0))) < 1e-8, "significant difference in variances"
+
+
+def test_dstandard_scaler_merge_masked_columns():
+    # A column can be entirely NaN in one batch and present in the next (seasonal sea ice in a
+    # per-gridpoint fit, say), or partly NaN by different amounts per batch. Merging must match a
+    # single fit over the pooled values: the empty side must not leak its NaN mean (0 * nan is nan),
+    # and each side must be weighted by its non-NaN count, not its row count.
+    rng = np.random.default_rng(0)
+    n = 400
+    names = ["always", "seasonal", "partial", "never"]
+
+    def make_batch(seasonal_valid, partial_nan_frac):
+        x = np.column_stack([
+            rng.normal(10, 3, n),
+            rng.normal(270, 2, n) if seasonal_valid else np.full(n, np.nan),
+            rng.normal(5, 1, n),
+            np.full(n, np.nan),
+        ])
+        x[:int(n * partial_nan_frac), 2] = np.nan
+        return pd.DataFrame(x, columns=names)
+
+    masked = make_batch(seasonal_valid=False, partial_nan_frac=0.9)
+    valid = make_batch(seasonal_valid=True, partial_nan_frac=0.0)
+    pooled = np.vstack([masked.values, valid.values])
+    with np.errstate(all="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        true_mean = np.nanmean(pooled, axis=0)
+        true_var = np.nanvar(pooled, axis=0)
+    true_n = np.count_nonzero(~np.isnan(pooled), axis=0)
+
+    def check(scaler, label):
+        mean, var = scaler.get_scales()
+        np.testing.assert_array_equal(scaler.n_, true_n, err_msg=f"{label}: counts")
+        np.testing.assert_allclose(mean[:3], true_mean[:3], rtol=1e-10, err_msg=f"{label}: mean")
+        np.testing.assert_allclose(var[:3], true_var[:3], rtol=1e-10, err_msg=f"{label}: var")
+        # Observed nowhere, so there is no mean to report.
+        assert np.isnan(mean[3]) and np.isnan(var[3]), f"{label}: a column empty everywhere should stay NaN"
+
+    sa = DStandardScaler()
+    sa.fit(masked)
+    sb = DStandardScaler()
+    sb.fit(valid)
+    check(sa + sb, "masked + valid")
+    check(sb + sa, "valid + masked")
+    for first, second, label in ((masked, valid, "fit(masked), fit(valid)"),
+                                 (valid, masked, "fit(valid), fit(masked)")):
+        running = DStandardScaler()
+        running.fit(first)
+        running.fit(second)
+        check(running, label)
+    # A refit with the columns in a different order still merges into the right columns.
+    running = DStandardScaler()
+    running.fit(masked)
+    running.fit(valid[names[::-1]])
+    check(running, "fit(masked), fit(valid reversed)")
+
+
+def test_dstandard_scaler_merge_unchanged_without_masking():
+    # Regression guard for the merge refactor: with no NaNs the combined moments must be exactly the
+    # original expression, bit for bit, not merely close to it.
+    rng = np.random.default_rng(1)
+    x_a = rng.normal(2, 5, (300, 4))
+    x_b = rng.normal(2, 5, (150, 4))
+    sa = DStandardScaler()
+    sa.fit(x_a)
+    sb = DStandardScaler()
+    sb.fit(x_b)
+    n_a, n_b = 300, 150
+    expected_mean = (n_a * sa.mean_x_ + n_b * sb.mean_x_) / (n_a + n_b)
+    expected_var = ((n_a * sa.var_x_ + n_b * sb.var_x_) / (n_a + n_b)
+                    + (n_a * n_b * (sa.mean_x_ - sb.mean_x_) ** 2) / ((n_a + n_b) ** 2))
+    refit = deepcopy(sa)
+    refit.fit(x_b)
+    for merged in (sa + sb, refit):
+        np.testing.assert_array_equal(merged.mean_x_, expected_mean)
+        np.testing.assert_array_equal(merged.var_x_, expected_var)
+        np.testing.assert_array_equal(merged.n_, np.full(4, n_a + n_b))
+
+
+def test_dstandard_scaler_legacy_scalar_count(tmp_path):
+    # Scalers saved before n_ became per-column store one total row count. They must still merge, and
+    # a per-column n_ must survive save/load.
+    rng = np.random.default_rng(2)
+    x_a = rng.normal(0, 1, (200, 3))
+    x_b = rng.normal(1, 2, (100, 3))
+    legacy = DStandardScaler()
+    legacy.fit(x_a)
+    legacy.n_ = 200
+    sb = DStandardScaler()
+    sb.fit(x_b)
+    reference = DStandardScaler()
+    reference.fit(x_a)
+    reference.fit(x_b)
+    for merged in (legacy + sb, sb + legacy):
+        np.testing.assert_array_equal(merged.n_, reference.n_)
+        np.testing.assert_allclose(merged.mean_x_, reference.mean_x_, rtol=1e-12)
+        np.testing.assert_allclose(merged.var_x_, reference.var_x_, rtol=1e-12)
+    legacy.fit(x_b)
+    np.testing.assert_allclose(legacy.var_x_, reference.var_x_, rtol=1e-12)
+
+    path = tmp_path / "scaler.json"
+    save_scaler(reference, path)
+    loaded = load_scaler(path)
+    np.testing.assert_array_equal(loaded.n_, reference.n_)
+    np.testing.assert_array_equal(loaded.mean_x_, reference.mean_x_)
 
 
 def test_dquantile_scaler():

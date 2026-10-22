@@ -11,6 +11,41 @@ from numba import guvectorize, float32, float64, void
 CENTROID_DTYPE = np.dtype([('mean', np.float64), ('weight', np.float64)])
 
 
+def _merge_moments(n_a, mean_a, var_a, n_b, mean_b, var_b):
+    """Combine two sets of per-channel (count, mean, variance) moments.
+
+    Used by both merge paths of DStandardScaler -- ``fit`` on an already-fit scaler and
+    ``__add__`` -- so the two cannot drift apart. Works on scalars or arrays.
+
+    A channel that saw only NaNs on one side has ``n=0`` and ``mean=var=nan``. Weighting
+    by the counts alone does not keep that side out of the result, because ``0 * nan`` is
+    ``nan``, not ``0``: one batch in which a channel was fully masked would poison it
+    permanently. Zeroing the empty side's moments first makes the merge return the other
+    side unchanged. A channel empty on *both* sides stays ``nan``. Channels with data on
+    both sides use the same arithmetic as before.
+    """
+    n_total = n_a + n_b
+    a_empty = n_a == 0
+    b_empty = n_b == 0
+    # Float counts: n_a * n_b below would overflow int64 for very large fits.
+    n_a = np.asarray(n_a, dtype=np.float64)
+    n_b = np.asarray(n_b, dtype=np.float64)
+    mean_a = np.where(a_empty, 0, mean_a)
+    var_a = np.where(a_empty, 0, var_a)
+    mean_b = np.where(b_empty, 0, mean_b)
+    var_b = np.where(b_empty, 0, var_b)
+    # Channels empty on both sides would divide 0 by 0; they are set back to nan below.
+    denom = np.where(n_total == 0, 1, n_a + n_b)
+    mean = (n_a * mean_a + n_b * mean_b) / denom
+    var = (n_a * var_a + n_b * var_b) / denom
+    # With one side empty its n is 0, so the between-group correction vanishes.
+    var = var + (n_a * n_b * (mean_a - mean_b) ** 2) / denom ** 2
+    both_empty = a_empty & b_empty
+    mean = np.where(both_empty, np.nan, mean)
+    var = np.where(both_empty, np.nan, var)
+    return n_total, mean, var
+
+
 class DBaseScaler(object):
     """
     Base distributed scaler class. Used only to store attributes and methods shared across all distributed
@@ -155,12 +190,33 @@ class DStandardScaler(DBaseScaler):
     supports numpy arrays, pandas dataframes, and xarray DataArrays and will return a transformed array in the
     same form as the original with column or coordinate names preserved.
 
+    ``n_`` holds one count of non-NaN values per column, so a column with NaNs is weighted by
+    the values it actually has when fits are merged.
     """
     def __init__(self, channels_last=True):
         self.mean_x_ = None
         self.n_ = 0
         self.var_x_ = None
         super().__init__(channels_last=channels_last)
+
+    @staticmethod
+    def _channel_stats(xc):
+        """Count, mean and variance of one column's values, ignoring NaNs at their exact positions.
+
+        An all-NaN column gives ``n=0`` and ``mean=var=nan``.
+        """
+        n = np.count_nonzero(~np.isnan(xc))
+        if n == 0:
+            return 0, np.nan, np.nan
+        return n, np.nanmean(xc), np.nanvar(xc)
+
+    def _channel_counts(self):
+        """Return ``n_`` as a per-column int64 array.
+
+        Scalers saved before ``n_`` became per-column store a single total row count, which is
+        broadcast to every column.
+        """
+        return np.broadcast_to(np.asarray(self.n_, dtype=np.int64), self.mean_x_.shape).copy()
 
     def fit(self, x, weight=None):
         x_columns, is_array = self.extract_x_columns(x, channels_last=self.channels_last)
@@ -169,23 +225,12 @@ class DStandardScaler(DBaseScaler):
         if not self._fit:
             self.x_columns_ = x_columns
             self.is_array_ = is_array
-            if len(xv.shape) > 2:
-                if self.channels_last:
-                    self.n_ += np.prod(xv.shape[:-1])
-                else:
-                    self.n_ += xv.shape[0] * np.prod(xv.shape[2:])
-            else:
-                self.n_ += xv.shape[0]
+            self.n_ = np.zeros(xv.shape[channel_dim], dtype=np.int64)
             self.mean_x_ = np.zeros(xv.shape[channel_dim], dtype=xv.dtype)
             self.var_x_ = np.zeros(xv.shape[channel_dim], dtype=xv.dtype)
-            if self.channels_last:
-                for i in range(xv.shape[channel_dim]):
-                    self.mean_x_[i] = np.nanmean(xv[..., i])
-                    self.var_x_[i] = np.nanvar(xv[..., i])
-            else:
-                for i in range(xv.shape[channel_dim]):
-                    self.mean_x_[i] = np.nanmean(xv[:, i])
-                    self.var_x_[i] = np.nanvar(xv[:, i])
+            for i in range(xv.shape[channel_dim]):
+                xc = xv[..., i] if self.channels_last else xv[:, i]
+                self.n_[i], self.mean_x_[i], self.var_x_[i] = self._channel_stats(xc)
 
         else:
             assert x.shape[channel_dim] == self.x_columns_.shape[0], "New data has a different number of columns"
@@ -198,27 +243,12 @@ class DStandardScaler(DBaseScaler):
                 x_col_order = self.get_column_order(x_columns)
             # update derived from
             # https://math.stackexchange.com/questions/2971315/how-do-i-combine-standard-deviations-of-two-groups
-            if len(xv.shape) > 2:
-                if self.channels_last:
-                    new_n = np.prod(xv.shape[:-1])
-                else:
-                    new_n = xv.shape[0] * np.prod(xv.shape[2:])
-            else:
-                new_n = xv.shape[0]
+            self.n_ = self._channel_counts()
             for i, o in enumerate(x_col_order):
-                if self.channels_last:
-                    new_mean = np.nanmean(xv[..., i])
-                    new_var = np.nanvar(xv[..., i])
-                else:
-                    new_mean = np.nanmean(xv[:, i])
-                    new_var = np.nanvar(xv[:, i])
-                combined_mean = (self.n_ * self.mean_x_[o] + new_n * new_mean) / (self.n_ + new_n)
-                weighted_var = (self.n_ * self.var_x_[o] + new_n * new_var) / (self.n_ + new_n)
-                var_correction = (self.n_ * new_n * (self.mean_x_[o] - new_mean) ** 2) / (
-                        (self.n_ + new_n) ** 2)
-                self.mean_x_[o] = combined_mean
-                self.var_x_[o] = weighted_var + var_correction
-            self.n_ += new_n
+                xc = xv[..., i] if self.channels_last else xv[:, i]
+                new_n, new_mean, new_var = self._channel_stats(xc)
+                self.n_[o], self.mean_x_[o], self.var_x_[o] = _merge_moments(
+                    self.n_[o], self.mean_x_[o], self.var_x_[o], new_n, new_mean, new_var)
         self._fit = True
 
     def transform(self, x, channels_last=None):
@@ -264,12 +294,9 @@ class DStandardScaler(DBaseScaler):
         assert type(other) is DStandardScaler, "Input is not DStandardScaler"
         assert np.all(other.x_columns_ == self.x_columns_), "Scaler columns do not match."
         current = deepcopy(self)
-        current.mean_x_ = (self.n_ * self.mean_x_ + other.n_ * other.mean_x_) / (self.n_ + other.n_)
-        combined_var = (self.n_ * self.var_x_ + other.n_ * other.var_x_) / (self.n_ + other.n_)
-        combined_var_corr = (self.n_ * other.n_ * (self.mean_x_ - other.mean_x_) ** 2) / (
-            (self.n_ + other.n_) ** 2)
-        current.var_x_ = combined_var + combined_var_corr
-        current.n_ = self.n_ + other.n_
+        current.n_, current.mean_x_, current.var_x_ = _merge_moments(
+            self._channel_counts(), self.mean_x_, self.var_x_,
+            other._channel_counts(), other.mean_x_, other.var_x_)
         return current
 
 
