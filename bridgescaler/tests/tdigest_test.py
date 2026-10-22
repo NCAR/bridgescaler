@@ -37,10 +37,7 @@ def crick_state(td):
 @pytest.mark.parametrize("name", list(tc.DATASETS))
 def test_port_matches_crick_fixture(reference, name):
     """The port reproduces crick's stored output bit-for-bit for every compression and fitting variant."""
-    x = tc.make_data(name)
-    if tc.data_hash(x) != str(reference[f"{name}|data_sha256"]):
-        pytest.fail(f"Generated data for {name} changed (numpy RNG stream differs from fixture numpy "
-                    f"{reference['numpy_version']}); regenerate with scripts/make_tdigest_fixtures.py")
+    x = reference[f"{name}|data"]
     for c in tc.COMPRESSIONS:
         for variant in tc.VARIANTS:
             key = tc.case_key(name, c, variant)
@@ -127,8 +124,8 @@ SCALER_COLUMNS = ["gaussian", "gamma_0.5", "bimodal", "trimodal", "cauchy", "int
                   "float32", "signed_zeros"]
 
 
-def _scaler_matrix():
-    return np.stack([tc.make_data(n).astype(np.float64) for n in SCALER_COLUMNS], axis=-1)
+def _scaler_matrix(reference):
+    return np.stack([reference[f"{n}|data"].astype(np.float64) for n in SCALER_COLUMNS], axis=-1)
 
 
 def _assert_scaler_matches(scaler, reference, variant, c=250):
@@ -140,7 +137,7 @@ def _assert_scaler_matches(scaler, reference, variant, c=250):
 
 
 def test_dquantile_scaler_matches_crick_fixture(reference):
-    x = _scaler_matrix()
+    x = _scaler_matrix(reference)
     single = DQuantileScaler(compression=250)
     single.fit(x)
     _assert_scaler_matches(single, reference, "single")
@@ -163,7 +160,7 @@ def test_dquantile_scaler_matches_crick_fixture(reference):
 def test_dquantile_scaler_tensor_matches_crick_fixture(reference):
     torch = pytest.importorskip("torch")
     from bridgescaler.distributed_tensor import DQuantileScalerTensor
-    x = torch.from_numpy(_scaler_matrix())
+    x = torch.from_numpy(_scaler_matrix(reference))
     x.variable_names = list(SCALER_COLUMNS)
     single = DQuantileScalerTensor(compression=250)
     single.fit(x)
@@ -216,3 +213,72 @@ def test_tdigest_api_edge_cases():
     clone = TDigest(100)
     clone.__setstate__(td.__getstate__())
     assert np.array_equal(clone.centroids(), td.centroids()) and clone.size() == td.size()
+
+
+@pytest.mark.parametrize("channel_axis", [-1, 1])
+@pytest.mark.parametrize("dtype", [np.float64, np.float32])
+def test_tdigest_arrays_match_per_channel(channel_axis, dtype):
+    """The prange batch fit/merge equals one TDigest per channel, fit on ``np.take(x, i, axis).ravel()``."""
+    from bridgescaler.tdigest import TDigestArrays
+    rng = np.random.default_rng(4)
+    x = rng.gamma(1.5, size=(30, 7, 12, 9)).astype(dtype)
+    x[rng.random(x.shape) < 0.02] = np.nan
+    x[(slice(None),) * (channel_axis % x.ndim) + (2,)] = np.nan  # an all-NaN channel
+    n = x.shape[channel_axis]
+    first, second = x[:13], x[13:]
+    batch = TDigestArrays.fit(first, 100, channel_axis=channel_axis)
+    batch.merge(TDigestArrays.fit(second, 100, channel_axis=channel_axis))
+    cents, size, t_min, t_max = batch.to_states()
+    for i in range(n):
+        td = TDigest(100)
+        td.update(np.take(first, i, channel_axis).ravel())
+        td.centroids()
+        other = TDigest(100)
+        other.update(np.take(second, i, channel_axis).ravel())
+        td.merge(other)
+        assert_state_equal((cents[i], size[i], t_min[i], t_max[i]), tc.to_state(td)[0],
+                           np.array(tc.to_state(td)[1:]), f"channel {i}")
+
+
+def test_tdigest_arrays_merge_targets():
+    from bridgescaler.tdigest import TDigestArrays
+    rng = np.random.default_rng(6)
+    x = rng.normal(size=(5000, 5))
+    y = rng.normal(2, 1, size=(4000, 3))
+    batch = TDigestArrays.fit(x, 250)
+    batch.merge(TDigestArrays.fit(y, 250), targets=[4, 0, 2])
+    cents = batch.to_states()[0]
+    for i in range(5):
+        td = TDigest(250)
+        td.update(x[:, i].copy())
+        td.centroids()
+        if i in (4, 0, 2):
+            other = TDigest(250)
+            other.update(y[:, [4, 0, 2].index(i)].copy())
+            td.merge(other)
+        assert np.array_equal(bits(cents[i]), bits(tc.to_state(td)[0])), f"channel {i}"
+    with pytest.raises(ValueError):
+        batch.merge(TDigestArrays.fit(y, 250), targets=[0, 0, 1])
+
+
+def test_dquantile_scaler_add_subset_columns():
+    import pandas as pd
+    rng = np.random.default_rng(9)
+    a = pd.DataFrame(rng.normal(size=(3000, 4)), columns=list("abcd"))
+    b = pd.DataFrame(rng.gamma(2.0, size=(2000, 2)), columns=["d", "b"])
+    sa, sb = DQuantileScaler(compression=100), DQuantileScaler(compression=100)
+    sa.fit(a)
+    sb.fit(b)
+    combined = sa + sb
+    for col in "abcd":
+        i = "abcd".index(col)
+        td = TDigest(100)
+        td.update(a[col].values)
+        td.centroids()
+        if col in ("d", "b"):
+            other = TDigest(100)
+            other.update(b[col].values)
+            td.merge(other)
+        ref = tc.to_state(td)
+        assert_state_equal((combined.centroids_[i], combined.size_[i], combined.min_[i], combined.max_[i]),
+                           ref[0], np.array(ref[1:]), col)

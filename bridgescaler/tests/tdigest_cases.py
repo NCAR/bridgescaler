@@ -4,7 +4,8 @@ Shared dataset and fitting-case definitions for the TDigest reproducibility test
 Each case fits one or more digests with a given ``TDigest`` class (crick's or bridgescaler's port) and returns
 the state bridgescaler persists: ``(centroids, size, min, max)``. ``scripts/make_tdigest_fixtures.py`` runs
 these with crick to produce the golden file, and ``tdigest_test.py`` runs them with the port and requires
-bit-for-bit equality.
+bit-for-bit equality. The fixture stores the generated inputs too, because numpy's distribution samplers are not
+bit-identical across platforms (e.g. x86 vs ARM); ``make_data`` is only reproducible on one machine.
 """
 import hashlib
 
@@ -59,10 +60,6 @@ def make_data(name):
     seed = int(hashlib.sha256(name.encode()).hexdigest()[:8], 16)
     rng = np.random.default_rng(seed)
     return DATASETS[name](rng, N)
-
-
-def data_hash(x):
-    return hashlib.sha256(np.ascontiguousarray(x).tobytes()).hexdigest()
 
 
 def unequal_split(x, k, seed=42):

@@ -23,8 +23,9 @@ def main():
     data_cache = {}
     for name, c, variant in tc.iter_cases():
         if name not in data_cache:
+            # store the inputs: numpy's normal/gamma/... samplers are not bit-identical across platforms
             data_cache[name] = tc.make_data(name)
-            out[f"{name}|data_sha256"] = np.array(tc.data_hash(data_cache[name]))
+            out[f"{name}|data"] = data_cache[name]
         centroids, size, t_min, t_max = tc.run_case(TDigest, name, c, variant, data_cache[name])
         key = tc.case_key(name, c, variant)
         out[key + "|centroids"] = centroids
