@@ -9,7 +9,8 @@ to a json file, and then repopulate a new scaler object with the same properties
 * numpy
 * pandas
 * xarray
-* pytdigest
+* numba
+* scipy
 
 ## Installation
 For a stable version of bridgescaler, you can install from PyPI.
@@ -145,6 +146,37 @@ scaler.fit(ps)                         # mean_x_ and var_x_ have shape (1, 192, 
 ps_norm = scaler.transform(ps)
 ps_back = scaler.inverse_transform(ps_norm)
 ```
+
+#### TDigest fitting
+`DQuantileScaler` and `DQuantileScalerTensor` summarize each variable with a merging t-digest. The fitting code
+is a numba port of the [crick](https://github.com/dask/crick) library (`bridgescaler.tdigest`), which is no
+longer a dependency. Its centroids, sizes, mins and maxes are bit-for-bit identical to crick 0.0.8. The one
+change is that `asin` is a portable fdlibm implementation instead of the platform libm, so results are also
+identical across platforms and devices. All variables are fit (and merged) in parallel with numba `prange`;
+set `NUMBA_NUM_THREADS` to control the thread count. The speed-up comes from that parallelism alone. Fitting one
+variable on its own is a few times slower than it was with crick, so a single-variable fit over many large batches
+takes longer than before.
+
+`DQuantileScalerTensor(fit_backend="torch")` opts in to a batched PyTorch fit (`bridgescaler.tdigest_tensor`)
+that runs on the data's device and produces the same bits as the numba backend. It is mainly useful to keep
+CUDA data on the GPU; it is not faster:
+
+| 200k values per variable, compression 250 | 64 variables | 256 variables |
+|---|---|---|
+| numba `prange`, 32-core Derecho CPU node (default) | 0.27 s | 0.70 s |
+| torch, compiled, CUDA graphs, A100 (`compile=True`) | 0.42 s | 0.79 s |
+
+Each t-digest flush depends on the previous one, so the GPU can only parallelize across variables. Compiling the
+torch fit takes several minutes per variable count (Inductor caches it on disk), and eager torch on CUDA is about
+10-30x slower than compiled. Eager mode pays kernel-launch overhead on every flush, and a large variable needs
+thousands of flushes, so an eager fit of a single large variable is far slower than the numba backend. Use
+`compile=True` for real sizes, or stay with the numba backend. `scripts/benchmark_tdigest_fit.py` reproduces these
+comparisons and checks the results bit-for-bit. The compiled-mode tests are skipped unless
+`BRIDGESCALER_TEST_COMPILE=1` is set.
+
+Scaler files written by this version carry an extra `fit_backend` entry. Older bridgescaler versions load them
+unchanged, since `read_scaler` stores every entry it finds as an attribute, and files from older versions load here
+with the numba backend.
 
 ### Group Scaler
 The group scalers use the same scaling parameters for a group of similar
