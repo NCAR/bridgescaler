@@ -1,7 +1,7 @@
 import numpy as np
 from numpy.lib.recfunctions import structured_to_unstructured, unstructured_to_structured
 from copy import deepcopy
-from crick import TDigest as CTDigest
+from .tdigest import TDigest as CTDigest, TDigestArrays
 from scipy.special import ndtr, ndtri
 import pandas as pd
 import xarray as xr
@@ -528,7 +528,7 @@ def tdigest_quantile(qv, cent_mean, cent_weight, t_min, t_max, out):
 
 class DQuantileScaler(DBaseScaler):
     """
-    Distributed Quantile Scaler that uses the crick TDigest Cython library to compute quantiles across multiple
+    Distributed Quantile Scaler that uses a TDigest (a numba port of the crick library) to compute quantiles across multiple
     datasets in parallel. The library can perform fitting, transforms, and inverse transforms across variables
     in parallel using the multiprocessing library. Multidimensional arrays are stored in shared memory across
     processes to minimize inter-process communication.
@@ -572,19 +572,23 @@ class DQuantileScaler(DBaseScaler):
                                           self.max_[i]))
         return td_objs
 
+    def td_arrays_to_attributes(self, td_arrays):
+        self.centroids_, self.size_, self.min_, self.max_ = td_arrays.to_states()
+        return
+
+    def attributes_to_td_arrays(self):
+        return TDigestArrays.from_states(self.centroids_, self.size_, self.min_, self.max_, self.compression)
+
     def fit(self, x, weight=None):
         x_columns, is_array = self.extract_x_columns(x, channels_last=self.channels_last)
         xv = self.extract_array(x)
         channel_dim = self.set_channel_dim()
+        # one digest per variable, fit in parallel over variables (numba prange)
+        new_td_arrays = TDigestArrays.fit(xv, self.compression, channel_axis=channel_dim)
         if not self._fit:
             self.x_columns_ = x_columns
             self.is_array_ = is_array
-            fit_var_func = partial(fit_variable,
-                                   xv_shared=xv,
-                                   compression=self.compression,
-                                   channels_last=self.channels_last)
-            td_objs = [fit_var_func(x) for x in np.arange(xv.shape[channel_dim])]
-            self.td_objs_to_attributes(td_objs)
+            self.td_arrays_to_attributes(new_td_arrays)
         else:
             assert x.shape[channel_dim] == self.x_columns_.shape[0], "New data has a different number of columns"
             if is_array:
@@ -594,15 +598,8 @@ class DQuantileScaler(DBaseScaler):
                     x_col_order = np.arange(x.shape[1])
             else:
                 x_col_order = self.get_column_order(x_columns)
-            td_objs = self.attributes_to_td_objs()
-            fit_var_func = partial(fit_variable,
-                                   xv_shared=xv,
-                                   compression=self.compression,
-                                   channels_last=self.channels_last)
-            new_td_objs = [fit_var_func(x) for x in np.arange(xv.shape[channel_dim])]
-            for i, o in enumerate(x_col_order):
-                td_objs[o].merge(new_td_objs[i])
-            self.td_objs_to_attributes(td_objs)
+            td_arrays = self.attributes_to_td_arrays().merge(new_td_arrays, targets=x_col_order)
+            self.td_arrays_to_attributes(td_arrays)
         self._fit = True
         return
 
@@ -688,14 +685,11 @@ class DQuantileScaler(DBaseScaler):
 
     def __add__(self, other):
         current = deepcopy(self)
-        td_objs = current.attributes_to_td_objs()
-        other_td_objs = other.attributes_to_td_objs()
         assert type(other) is DQuantileScaler, "Adding mismatched scaler types."
         assert current.is_fit() and other.is_fit(), "At least one scaler is not fit."
         x_col_order = current.get_column_order(other.x_columns_)
         assert x_col_order.size > 0, "No matching columns in other DQuantileScaler"
-        for i, o in enumerate(x_col_order):
-            td_objs[o].merge(other_td_objs[i])
-        current.td_objs_to_attributes(td_objs)
+        td_arrays = current.attributes_to_td_arrays().merge(other.attributes_to_td_arrays(), targets=x_col_order)
+        current.td_arrays_to_attributes(td_arrays)
         return current
 

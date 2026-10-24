@@ -8,7 +8,8 @@ import weakref
 from copy import deepcopy
 from functools import partial
 
-from crick import TDigest as CTDigest
+from .tdigest import TDigest as CTDigest, TDigestArrays
+from .tdigest_tensor import TDigestBatch, fit_tdigest_batch, merge_tdigest_batch
 import numpy as np
 from numpy.lib.recfunctions import structured_to_unstructured, unstructured_to_structured
 CENTROID_DTYPE = np.dtype([('mean', np.float64), ('weight', np.float64)])
@@ -785,6 +786,18 @@ class DMinMaxScalerTensor(DBaseScalerTensor):
         return current
 
 
+def fit_tdigest_arrays_tensor(xv, compression, channel_dim):
+    """Fit one TDigest per channel of ``xv`` with the numba backend, in parallel over channels."""
+    if xv.is_cuda:
+        warnings.warn(
+            "Performance Warning: Tensor is on GPU. Keep data on CPU for fitting to "
+            "avoid implicit GPU-to-CPU copies and performance slowdowns.",
+            RuntimeWarning,
+            stacklevel=3
+        )
+    return TDigestArrays.fit(xv.cpu().numpy(), compression, channel_axis=channel_dim)
+
+
 def fit_variable_tensor(var_index, xv, compression=None, channels_last=None):
     # Check if the tensor is on GPU
     if xv.is_cuda:
@@ -1057,7 +1070,7 @@ def pchip_eval_tensor(x_knots, z_knots, m_knots, xv):
 
 class DQuantileScalerTensor(DBaseScalerTensor):
     """
-    Distributed Quantile Scaler for tensors that uses the crick TDigest Cython library to compute quantiles across multiple
+    Distributed Quantile Scaler for tensors that uses a TDigest (a numba port of the crick library) to compute quantiles across multiple
     datasets in parallel. The library can perform fitting, transforms, and inverse transforms.
 
     DQuantileScaler supports
@@ -1080,9 +1093,17 @@ class DQuantileScalerTensor(DBaseScalerTensor):
             scripts/quantile_lut_experiment.py). Default False.
         n_knots: Number of PCHIP knots per variable when ``fast_transform`` is enabled (default 256). Ignored
             otherwise. Must be >= 4.
+        fit_backend: How the TDigests are fit; both give bit-identical results. ``"numba"`` (default) copies the
+            data to the CPU and fits all variables in parallel with ``bridgescaler.tdigest`` (numba ``prange``
+            over variables). ``"torch"`` (opt-in) fits all variables at once on the data's device with
+            ``bridgescaler.tdigest_tensor`` (CPU or CUDA; MPS data is fit on the CPU since MPS has no float64),
+            using ``torch.compile`` (with CUDA graphs on CUDA) when ``compile`` is True. Eager torch issues ~150
+            small kernels per flush and is only practical on CPU. Compiled CUDA takes minutes to compile per
+            variable count (cached on disk afterwards) and ran at about 0.65x (64 variables) to 0.9x (256
+            variables) the speed of the numba backend on a 32-core node, so use it to keep data on the GPU.
     """
     def __init__(self, compression=250, distribution="uniform", min_val=0.0000001, max_val=0.9999999,
-                 channels_last=True, compile=False, fast_transform=False, n_knots=256):
+                 channels_last=True, compile=False, fast_transform=False, n_knots=256, fit_backend="numba"):
         self.compression = compression
         self.distribution = distribution
         self.min_val = min_val
@@ -1090,6 +1111,7 @@ class DQuantileScalerTensor(DBaseScalerTensor):
         self.compile = compile
         self.fast_transform = fast_transform
         self.n_knots = n_knots
+        self.fit_backend = fit_backend
         self.centroids_ = None
         self.size_ = None
         self.min_ = None
@@ -1130,6 +1152,38 @@ class DQuantileScalerTensor(DBaseScalerTensor):
                                           self.min_[i],
                                           self.max_[i]))
         return td_objs
+
+    def td_arrays_to_attributes(self, td_arrays):
+        self.centroids_, self.size_, self.min_, self.max_ = td_arrays.to_states()
+        return
+
+    def attributes_to_td_arrays(self):
+        return TDigestArrays.from_states(self.centroids_, self.size_, self.min_, self.max_, self.compression)
+
+    def batch_to_attributes(self, batch):
+        self.centroids_, size, self.min_, self.max_ = batch.to_states()
+        self.size_ = np.asarray(size)
+        return
+
+    def _use_torch_fit(self, x):
+        backend = getattr(self, "fit_backend", "numba")
+        if backend not in ("torch", "numba"):
+            raise ValueError(f"Unknown fit_backend {backend!r}; use 'numba' or 'torch'.")
+        return backend == "torch"
+
+    def _fit_batch(self, xv):
+        """Fit one TDigest per channel of ``xv`` with the batched torch implementation, in input channel order."""
+        channel_dim = self.set_channel_dim()
+        x2d = xv.movedim(channel_dim, 0).reshape(xv.shape[channel_dim], -1)
+        if x2d.device.type == "mps":
+            x2d = x2d.cpu()
+        return fit_tdigest_batch(x2d, self.compression, compile=self._torch_fit_compile(x2d))
+
+    def _torch_fit_compile(self, x):
+        """torch.compile setting for the torch fit backend: CUDA graphs on CUDA, plain compile elsewhere."""
+        if not self.compile:
+            return False
+        return "reduce-overhead" if x.device.type == "cuda" else True
 
     def tensorize_attributes(self):
         self.centroids_mean_tensor = [torch.from_numpy(c[:, 0]) for c in self.centroids_]    # "mean"
@@ -1240,31 +1294,27 @@ class DQuantileScalerTensor(DBaseScalerTensor):
         x_columns, has_attribute = self.extract_x_columns(x, channels_last=self.channels_last)
         xv = x
         channel_dim = self.set_channel_dim()
-        if not self._fit:
-            self.x_columns_ = x_columns
-            fit_var_func = partial(fit_variable_tensor,
-                                   xv=xv,
-                                   compression=self.compression,
-                                   channels_last=self.channels_last)
-            td_objs = [fit_var_func(x) for x in range(xv.shape[channel_dim])]
-            self.td_objs_to_attributes(td_objs)
-            self.tensorize_attributes()
-        else:
+        if self._fit:
             # Update existing scaler with new data
             assert (
                     x.shape[channel_dim] == len(self.x_columns_)
             ), "New data has a different number of variables."
-            x_col_order = self.get_column_order(x_columns)
-            td_objs = self.attributes_to_td_objs()
-            fit_var_func = partial(fit_variable_tensor,
-                                   xv=xv,
-                                   compression=self.compression,
-                                   channels_last=self.channels_last)
-            new_td_objs = [fit_var_func(x) for x in range(xv.shape[channel_dim])]
-            for i, o in enumerate(x_col_order):
-                td_objs[o].merge(new_td_objs[i])
-            self.td_objs_to_attributes(td_objs)
-            self.tensorize_attributes()
+        else:
+            self.x_columns_ = x_columns
+        if self._use_torch_fit(xv):
+            new = self._fit_batch(xv)
+            if self._fit:
+                current = TDigestBatch.from_states(self.centroids_, self.size_, self.min_, self.max_,
+                                                   self.compression, device=new.mean.device)
+                new = merge_tdigest_batch(current, new.select(self.get_fit_column_order(x_columns)),
+                                          compile=self._torch_fit_compile(new.mean))
+            self.batch_to_attributes(new)
+        else:
+            new = fit_tdigest_arrays_tensor(xv, self.compression, channel_dim)
+            if self._fit:
+                new = self.attributes_to_td_arrays().merge(new, targets=self.get_column_order(x_columns))
+            self.td_arrays_to_attributes(new)
+        self.tensorize_attributes()
         self._fit = True
         return
 
@@ -1396,10 +1446,6 @@ class DQuantileScalerTensor(DBaseScalerTensor):
         assert current.is_fit() and other.is_fit(), "At least one scaler is not fit."
         assert other.x_columns_ == self.x_columns_, "Scaler variables do not match."
 
-        td_objs = current.attributes_to_td_objs()
-        other_td_objs = other.attributes_to_td_objs()
-        for i in range(len(td_objs)):
-            td_objs[i].merge(other_td_objs[i])
-        current.td_objs_to_attributes(td_objs)
+        current.td_arrays_to_attributes(current.attributes_to_td_arrays().merge(other.attributes_to_td_arrays()))
         current.tensorize_attributes()
         return current
