@@ -280,6 +280,47 @@ class DStandardScalerTensor(DBaseScalerTensor):
         var = (dev ** 2).sum(dim=reduce_dims) / n
         return mean, var, n
 
+    @staticmethod
+    def _merge_moments(n_a, mean_a, var_a, n_b, mean_b, var_b):
+        """Combine two sets of per-channel (count, mean, variance) moments.
+
+        Used by both merge paths -- ``fit`` on an already-fit scaler and ``__add__`` --
+        so the two cannot drift apart.
+
+        A channel that saw only NaNs on one side comes out of ``_nan_aware_stats`` with
+        ``n=0`` and ``mean=var=nan``. Weighting by the counts alone does not keep that
+        side out of the result, because ``0 * nan`` is ``nan``, not ``0``: a single batch
+        in which a channel was fully masked would otherwise poison it permanently, and
+        every later merge would carry the NaN forward. Zeroing the empty side's moments
+        first makes the merge return the other side unchanged. This matters for masked
+        geophysical fields fit per-gridpoint, where a cell can be absent from one batch
+        (seasonal sea ice, say) and present in the next.
+
+        A channel empty on *both* sides stays ``nan`` -- nothing has been observed there,
+        so there is no mean to report. Channels with data on both sides are unaffected:
+        the arithmetic is unchanged for them.
+        """
+        n_total = n_a + n_b
+        a_empty = n_a == 0
+        b_empty = n_b == 0
+        zero = torch.zeros((), dtype=mean_a.dtype, device=mean_a.device)
+        mean_a = torch.where(a_empty, zero, mean_a)
+        var_a = torch.where(a_empty, zero, var_a)
+        mean_b = torch.where(b_empty, zero, mean_b)
+        var_b = torch.where(b_empty, zero, var_b)
+        # Channels empty on both sides would divide 0 by 0; they are set back to nan below.
+        denom = torch.where(n_total == 0, torch.ones_like(n_total), n_total)
+        mean = (n_a * mean_a + n_b * mean_b) / denom
+        var = (n_a * var_a + n_b * var_b) / denom
+        # The between-group correction reads both means, so it needs the zeroed ones too:
+        # with one side empty its n is 0 and the whole term vanishes, as it should.
+        var = var + (n_a * n_b * (mean_a - mean_b) ** 2) / denom ** 2
+        both_empty = a_empty & b_empty
+        nan = torch.full((), float("nan"), dtype=mean.dtype, device=mean.device)
+        mean = torch.where(both_empty, nan, mean)
+        var = torch.where(both_empty, nan, var)
+        return n_total, mean, var
+
     def fit(self, x, weight=None):
         x_columns, has_attribute = self.extract_x_columns(x, channels_last=self.channels_last)
         xv = x
@@ -297,18 +338,9 @@ class DStandardScalerTensor(DBaseScalerTensor):
             x_col_order = self.get_fit_column_order(x_columns)
             sub = xv[..., x_col_order] if self.channels_last else xv[:, x_col_order]
             new_mean, new_var, new_n = self._nan_aware_stats(sub, reduce_dims, reshape_fn)
-            combined_mean = (self.n_ * self.mean_x_ + new_n * new_mean) / (
-                self.n_ + new_n
+            self.n_, self.mean_x_, self.var_x_ = self._merge_moments(
+                self.n_, self.mean_x_, self.var_x_, new_n, new_mean, new_var
             )
-            weighted_var = (self.n_ * self.var_x_ + new_n * new_var) / (
-                self.n_ + new_n
-            )
-            var_correction = (
-                self.n_ * new_n * (self.mean_x_ - new_mean) ** 2
-            ) / ((self.n_ + new_n) ** 2)
-            self.mean_x_ = combined_mean
-            self.var_x_ = weighted_var + var_correction
-            self.n_ += new_n
         self._fit = True
 
     def transform(self, x, channels_last=None):
@@ -369,11 +401,9 @@ class DStandardScalerTensor(DBaseScalerTensor):
         assert current.is_fit() and other.is_fit(), "At least one scaler is not fit."
         assert other.x_columns_ == self.x_columns_, "Scaler variables do not match."
 
-        current.mean_x_ = (self.n_ * self.mean_x_ + other.n_ * other.mean_x_) / (self.n_ + other.n_)
-        combined_var = (self.n_ * self.var_x_ + other.n_ * other.var_x_) / (self.n_ + other.n_)
-        combined_var_corr = (self.n_ * other.n_ * (self.mean_x_ - other.mean_x_) ** 2) / ((self.n_ + other.n_) ** 2)
-        current.var_x_ = combined_var + combined_var_corr
-        current.n_ = self.n_ + other.n_
+        current.n_, current.mean_x_, current.var_x_ = self._merge_moments(
+            self.n_, self.mean_x_, self.var_x_, other.n_, other.mean_x_, other.var_x_
+        )
         return current
 
 
