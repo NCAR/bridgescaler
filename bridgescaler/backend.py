@@ -98,9 +98,10 @@ def print_scaler(scaler):
 
 def object_hook(dct: dict[Any, Any]):
     if "__numpy__" in dct:
+        # frombuffer returns a read-only view of the bytes; copy so a loaded scaler can be refit.
         np_obj = np.frombuffer(
             b64decode(dct["__numpy__"]), descr_to_dtype(dct["dtype"])
-        )
+        ).copy()
         return np_obj.reshape(shape) if (shape := dct["shape"]) else np_obj[0]
     return dct
 

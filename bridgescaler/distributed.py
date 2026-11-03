@@ -28,25 +28,26 @@ def _merge_moments(
     by the counts alone does not keep that side out of the result, because ``0 * nan`` is
     ``nan``, not ``0``: one batch in which a channel was fully masked would poison it
     permanently. Zeroing the empty side's moments first makes the merge return the other
-    side unchanged. A channel empty on *both* sides stays ``nan``. Channels with data on
-    both sides use the same arithmetic as before.
+    side unchanged. A channel empty on *both* sides stays ``nan``.
+
+    The merge is written in terms of each side's fraction of the total, ``w = n / n_total``,
+    so ``n_a * n_b`` is never formed and cannot overflow, matching
+    ``DStandardScalerTensor._merge_moments``.
     """
     n_total = n_a + n_b
     a_empty = n_a == 0
     b_empty = n_b == 0
-    # Float counts: n_a * n_b below would overflow int64 for very large fits.
-    n_a = np.asarray(n_a, dtype=np.float64)
-    n_b = np.asarray(n_b, dtype=np.float64)
     mean_a = np.where(a_empty, 0, mean_a)
     var_a = np.where(a_empty, 0, var_a)
     mean_b = np.where(b_empty, 0, mean_b)
     var_b = np.where(b_empty, 0, var_b)
     # Channels empty on both sides would divide 0 by 0; they are set back to nan below.
-    denom = np.where(n_total == 0, 1, n_a + n_b)
-    mean = (n_a * mean_a + n_b * mean_b) / denom
-    var = (n_a * var_a + n_b * var_b) / denom
-    # With one side empty its n is 0, so the between-group correction vanishes.
-    var = var + (n_a * n_b * (mean_a - mean_b) ** 2) / denom ** 2
+    denom = np.where(n_total == 0, 1, n_total).astype(np.float64)
+    w_a = n_a / denom
+    w_b = n_b / denom
+    mean = w_a * mean_a + w_b * mean_b
+    # With one side empty its weight is 0, so the between-group correction vanishes.
+    var = w_a * var_a + w_b * var_b + w_a * w_b * (mean_a - mean_b) ** 2
     both_empty = a_empty & b_empty
     mean = np.where(both_empty, np.nan, mean)
     var = np.where(both_empty, np.nan, var)
@@ -198,7 +199,9 @@ class DStandardScaler(DBaseScaler):
     same form as the original with column or coordinate names preserved.
 
     ``n_`` holds one count of non-NaN values per column, so a column with NaNs is weighted by
-    the values it actually has when fits are merged.
+    the values it actually has when fits are merged. ``mean_x_`` and ``var_x_`` are float64 whatever
+    the input dtype: float32 stats stop absorbing new data once a batch is a tiny fraction of the
+    total, which happens on long-running fits. ``transform`` still returns the input's dtype.
     """
     def __init__(self, channels_last=True):
         self.mean_x_ = None
@@ -233,8 +236,8 @@ class DStandardScaler(DBaseScaler):
             self.x_columns_ = x_columns
             self.is_array_ = is_array
             self.n_ = np.zeros(xv.shape[channel_dim], dtype=np.int64)
-            self.mean_x_ = np.zeros(xv.shape[channel_dim], dtype=xv.dtype)
-            self.var_x_ = np.zeros(xv.shape[channel_dim], dtype=xv.dtype)
+            self.mean_x_ = np.zeros(xv.shape[channel_dim], dtype=np.float64)
+            self.var_x_ = np.zeros(xv.shape[channel_dim], dtype=np.float64)
             for i in range(xv.shape[channel_dim]):
                 xc = xv[..., i] if self.channels_last else xv[:, i]
                 self.n_[i], self.mean_x_[i], self.var_x_[i] = self._channel_stats(xc)
@@ -251,6 +254,9 @@ class DStandardScaler(DBaseScaler):
             # update derived from
             # https://math.stackexchange.com/questions/2971315/how-do-i-combine-standard-deviations-of-two-groups
             self.n_ = self._channel_counts()
+            # Scalers saved before the stats were float64 may hold float32 ones; upcast before updating.
+            self.mean_x_ = np.asarray(self.mean_x_, dtype=np.float64)
+            self.var_x_ = np.asarray(self.var_x_, dtype=np.float64)
             for i, o in enumerate(x_col_order):
                 xc = xv[..., i] if self.channels_last else xv[:, i]
                 new_n, new_mean, new_var = self._channel_stats(xc)
@@ -304,11 +310,9 @@ class DStandardScaler(DBaseScaler):
         current.n_, mean, var = _merge_moments(
             self._channel_counts(), self.mean_x_, self.var_x_,
             other._channel_counts(), other.mean_x_, other.var_x_)
-        # The merge runs in float64; store the result in the scalers' own float dtype, as a refit does.
-        # Promoting with float16 keeps float32/float64 as they are and turns an integer dtype into float64.
-        dtype = np.promote_types(np.result_type(self.mean_x_, other.mean_x_), np.float16)
-        current.mean_x_ = mean.astype(dtype)
-        current.var_x_ = var.astype(dtype)
+        # The merge runs in float64 and the result is kept in float64, as a refit does.
+        current.mean_x_ = np.asarray(mean, dtype=np.float64)
+        current.var_x_ = np.asarray(var, dtype=np.float64)
         return current
 
 

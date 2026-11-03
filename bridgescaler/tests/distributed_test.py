@@ -1,6 +1,7 @@
 from bridgescaler.distributed import DStandardScaler, DMinMaxScaler, DQuantileScaler
 from bridgescaler import save_scaler, load_scaler, print_scaler, read_scaler
 import numpy as np
+import pytest
 import pandas as pd
 import xarray as xr
 import os
@@ -183,8 +184,9 @@ def test_dstandard_scaler_merge_masked_columns():
 
 
 def test_dstandard_scaler_merge_unchanged_without_masking():
-    # Regression guard for the merge refactor: with no NaNs the combined moments must be exactly the
-    # original expression, bit for bit, not merely close to it.
+    # Regression guard for the merge refactor: with no NaNs the combined moments must match the original
+    # count-weighted expression. The merge now uses count fractions (so n_a * n_b is never formed), which
+    # changes the rounding, so this holds to a few ulps rather than bit for bit.
     rng = np.random.default_rng(1)
     x_a = rng.normal(2, 5, (300, 4))
     x_b = rng.normal(2, 5, (150, 4))
@@ -199,8 +201,8 @@ def test_dstandard_scaler_merge_unchanged_without_masking():
     refit = deepcopy(sa)
     refit.fit(x_b)
     for merged in (sa + sb, refit):
-        np.testing.assert_array_equal(merged.mean_x_, expected_mean)
-        np.testing.assert_array_equal(merged.var_x_, expected_var)
+        np.testing.assert_allclose(merged.mean_x_, expected_mean, rtol=1e-14, atol=0)
+        np.testing.assert_allclose(merged.var_x_, expected_var, rtol=1e-14, atol=0)
         np.testing.assert_array_equal(merged.n_, np.full(4, n_a + n_b))
 
 
@@ -232,23 +234,96 @@ def test_dstandard_scaler_legacy_scalar_count(tmp_path):
     np.testing.assert_array_equal(loaded.mean_x_, reference.mean_x_)
 
 
-def test_dstandard_scaler_merge_keeps_dtype():
-    # Both merge paths store the result in the scalers' own dtype: a float32 fit stays float32 after +,
-    # as it does after a refit.
+
+@pytest.mark.parametrize("scaler_class", [DStandardScaler, DMinMaxScaler, DQuantileScaler])
+def test_loaded_scaler_can_refit(tmp_path, scaler_class):
+    # load_scaler decodes arrays from base64 bytes; they must come back writeable, or refitting a loaded
+    # scaler fails on its in-place updates.
+    rng = np.random.default_rng(4)
+    x_a = rng.normal(0, 1, (200, 3))
+    x_b = rng.normal(1, 2, (100, 3))
+    never_saved = scaler_class()
+    never_saved.fit(x_a)
+    path = tmp_path / "scaler.json"
+    save_scaler(never_saved, path)
+    loaded = load_scaler(path)
+    never_saved.fit(x_b)
+    loaded.fit(x_b)
+    np.testing.assert_array_equal(loaded.transform(x_b), never_saved.transform(x_b))
+    for attr in ("n_", "mean_x_", "var_x_", "min_x_", "max_x_"):
+        if hasattr(never_saved, attr):
+            np.testing.assert_array_equal(getattr(loaded, attr), getattr(never_saved, attr))
+
+
+def test_dstandard_scaler_float64_stats():
+    # Both merge paths store float64 stats, even for a float32 fit, and agree with each other. Transform
+    # output still follows the input dtype.
     rng = np.random.default_rng(3)
     x_a = rng.normal(0, 1, (200, 3)).astype(np.float32)
     x_b = rng.normal(1, 2, (100, 3)).astype(np.float32)
     sa = DStandardScaler()
     sa.fit(x_a)
+    assert sa.mean_x_.dtype == np.float64 and sa.var_x_.dtype == np.float64
     sb = DStandardScaler()
     sb.fit(x_b)
     refit = deepcopy(sa)
     refit.fit(x_b)
     added = sa + sb
     for merged in (added, refit):
-        assert merged.mean_x_.dtype == np.float32 and merged.var_x_.dtype == np.float32
-    np.testing.assert_array_equal(added.mean_x_, refit.mean_x_)
-    np.testing.assert_array_equal(added.var_x_, refit.var_x_)
+        assert merged.mean_x_.dtype == np.float64 and merged.var_x_.dtype == np.float64
+        assert merged.transform(x_b).dtype == np.float32
+        assert merged.inverse_transform(x_b).dtype == np.float32
+    np.testing.assert_allclose(added.mean_x_, refit.mean_x_, rtol=1e-14, atol=0)
+    np.testing.assert_allclose(added.var_x_, refit.var_x_, rtol=1e-14, atol=0)
+
+
+def test_dstandard_scaler_large_count_precision():
+    # A long-running float32 fit: float32 stats cannot absorb an update of weight 64 / 2**30 ~ 6e-8.
+    # With float64 stats the merged moments match a float64 reference.
+    rng = np.random.default_rng(5)
+    big_n = 2 ** 30 + 1
+    s = DStandardScaler()
+    s.fit(rng.normal(0, 1, (500, 3)).astype(np.float32))
+    s.n_ = np.full(3, big_n, dtype=np.int64)
+    mean_a, var_a = s.mean_x_.copy(), s.var_x_.copy()
+    x_b = (rng.normal(100, 3, (64, 3))).astype(np.float32)
+    s.fit(x_b)
+    np.testing.assert_array_equal(s.n_, np.full(3, big_n + 64))
+    x_b64 = x_b.astype(np.float64)
+    n = float(big_n + 64)
+    w_a, w_b = big_n / n, 64 / n
+    ref_mean = w_a * mean_a + w_b * x_b64.mean(0)
+    ref_var = w_a * var_a + w_b * x_b64.var(0) + w_a * w_b * (mean_a - x_b64.mean(0)) ** 2
+    # The batch's own stats are reduced in float32; their rounding enters with weight ~6e-8.
+    np.testing.assert_allclose(s.mean_x_, ref_mean, rtol=1e-9, atol=0)
+    np.testing.assert_allclose(s.var_x_, ref_var, rtol=1e-9, atol=0)
+    assert (s.mean_x_ != mean_a).all(), "new data must move the mean"
+
+
+def test_dstandard_scaler_legacy_float32_stats(tmp_path):
+    # Scalers saved before the stats were float64 hold float32 mean_x_/var_x_. They still load, merge and
+    # refit, and come out as float64.
+    rng = np.random.default_rng(6)
+    x_a = rng.normal(0, 1, (200, 3)).astype(np.float32)
+    x_b = rng.normal(1, 2, (100, 3)).astype(np.float32)
+    reference = DStandardScaler()
+    reference.fit(x_a)
+    reference.fit(x_b)
+    legacy = DStandardScaler()
+    legacy.fit(x_a)
+    legacy.mean_x_ = legacy.mean_x_.astype(np.float32)
+    legacy.var_x_ = legacy.var_x_.astype(np.float32)
+    path = tmp_path / "legacy.json"
+    save_scaler(legacy, path)
+    sb = DStandardScaler()
+    sb.fit(x_b)
+    refit = load_scaler(path)
+    refit.fit(x_b)
+    for merged in (load_scaler(path) + sb, sb + load_scaler(path), refit):
+        assert merged.mean_x_.dtype == np.float64 and merged.var_x_.dtype == np.float64
+        np.testing.assert_array_equal(merged.n_, reference.n_)
+        np.testing.assert_allclose(merged.mean_x_, reference.mean_x_, rtol=1e-6, atol=1e-7)
+        np.testing.assert_allclose(merged.var_x_, reference.var_x_, rtol=1e-6, atol=1e-7)
 
 
 def test_dquantile_scaler():
