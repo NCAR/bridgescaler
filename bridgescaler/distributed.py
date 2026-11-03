@@ -11,7 +11,14 @@ from numba import guvectorize, float32, float64, void
 CENTROID_DTYPE = np.dtype([('mean', np.float64), ('weight', np.float64)])
 
 
-def _merge_moments(n_a, mean_a, var_a, n_b, mean_b, var_b):
+def _merge_moments(
+    n_a: np.ndarray | int,
+    mean_a: np.ndarray | float,
+    var_a: np.ndarray | float,
+    n_b: np.ndarray | int,
+    mean_b: np.ndarray | float,
+    var_b: np.ndarray | float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Combine two sets of per-channel (count, mean, variance) moments.
 
     Used by both merge paths of DStandardScaler -- ``fit`` on an already-fit scaler and
@@ -200,7 +207,7 @@ class DStandardScaler(DBaseScaler):
         super().__init__(channels_last=channels_last)
 
     @staticmethod
-    def _channel_stats(xc):
+    def _channel_stats(xc: np.ndarray) -> tuple[int, float, float]:
         """Count, mean and variance of one column's values, ignoring NaNs at their exact positions.
 
         An all-NaN column gives ``n=0`` and ``mean=var=nan``.
@@ -210,7 +217,7 @@ class DStandardScaler(DBaseScaler):
             return 0, np.nan, np.nan
         return n, np.nanmean(xc), np.nanvar(xc)
 
-    def _channel_counts(self):
+    def _channel_counts(self) -> np.ndarray:
         """Return ``n_`` as a per-column int64 array.
 
         Scalers saved before ``n_`` became per-column store a single total row count, which is
@@ -294,9 +301,14 @@ class DStandardScaler(DBaseScaler):
         assert type(other) is DStandardScaler, "Input is not DStandardScaler"
         assert np.all(other.x_columns_ == self.x_columns_), "Scaler columns do not match."
         current = deepcopy(self)
-        current.n_, current.mean_x_, current.var_x_ = _merge_moments(
+        current.n_, mean, var = _merge_moments(
             self._channel_counts(), self.mean_x_, self.var_x_,
             other._channel_counts(), other.mean_x_, other.var_x_)
+        # The merge runs in float64; store the result in the scalers' own float dtype, as a refit does.
+        # Promoting with float16 keeps float32/float64 as they are and turns an integer dtype into float64.
+        dtype = np.promote_types(np.result_type(self.mean_x_, other.mean_x_), np.float16)
+        current.mean_x_ = mean.astype(dtype)
+        current.var_x_ = var.astype(dtype)
         return current
 
 

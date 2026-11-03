@@ -281,11 +281,22 @@ class DStandardScalerTensor(DBaseScalerTensor):
         return mean, var, n
 
     @staticmethod
-    def _merge_moments(n_a, mean_a, var_a, n_b, mean_b, var_b):
+    def _merge_moments(
+        n_a: torch.Tensor | int | float,
+        mean_a: torch.Tensor,
+        var_a: torch.Tensor,
+        n_b: torch.Tensor | int | float,
+        mean_b: torch.Tensor,
+        var_b: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Combine two sets of per-channel (count, mean, variance) moments.
 
         Used by both merge paths -- ``fit`` on an already-fit scaler and ``__add__`` --
         so the two cannot drift apart.
+
+        A count may be a plain number rather than a per-channel tensor: scalers saved before
+        the NaN-aware fit stored one total count, and scalers built by hand often set
+        ``n_ = 1``. Such a count is applied to every channel.
 
         A channel that saw only NaNs on one side comes out of ``_nan_aware_stats`` with
         ``n=0`` and ``mean=var=nan``. Weighting by the counts alone does not keep that
@@ -300,6 +311,9 @@ class DStandardScalerTensor(DBaseScalerTensor):
         so there is no mean to report. Channels with data on both sides are unaffected:
         the arithmetic is unchanged for them.
         """
+        # torch.where needs a tensor condition, so a plain-number count must become a tensor first.
+        n_a = torch.as_tensor(n_a, dtype=mean_a.dtype, device=mean_a.device)
+        n_b = torch.as_tensor(n_b, dtype=mean_b.dtype, device=mean_b.device)
         n_total = n_a + n_b
         a_empty = n_a == 0
         b_empty = n_b == 0

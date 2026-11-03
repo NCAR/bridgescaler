@@ -232,6 +232,25 @@ def test_dstandard_scaler_legacy_scalar_count(tmp_path):
     np.testing.assert_array_equal(loaded.mean_x_, reference.mean_x_)
 
 
+def test_dstandard_scaler_merge_keeps_dtype():
+    # Both merge paths store the result in the scalers' own dtype: a float32 fit stays float32 after +,
+    # as it does after a refit.
+    rng = np.random.default_rng(3)
+    x_a = rng.normal(0, 1, (200, 3)).astype(np.float32)
+    x_b = rng.normal(1, 2, (100, 3)).astype(np.float32)
+    sa = DStandardScaler()
+    sa.fit(x_a)
+    sb = DStandardScaler()
+    sb.fit(x_b)
+    refit = deepcopy(sa)
+    refit.fit(x_b)
+    added = sa + sb
+    for merged in (added, refit):
+        assert merged.mean_x_.dtype == np.float32 and merged.var_x_.dtype == np.float32
+    np.testing.assert_array_equal(added.mean_x_, refit.mean_x_)
+    np.testing.assert_array_equal(added.var_x_, refit.var_x_)
+
+
 def test_dquantile_scaler():
     dsses_2d = []
     dsses_4d = []

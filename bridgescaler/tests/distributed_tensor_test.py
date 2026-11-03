@@ -234,6 +234,41 @@ def test_dstandard_scaler_merge_unchanged_without_masking():
     assert torch.equal(merged.n_, n_a + n_b)
 
 
+def test_dstandard_scaler_merge_scalar_count():
+    # Scalers saved before the NaN-aware fit stored n_ as one total count, and scalers built by hand often
+    # set n_ = 1. Both merge paths must accept a plain-number n_ and apply it to every channel.
+    torch.manual_seed(2)
+    x_a = torch.randn(200, 3, dtype=torch.float64)
+    x_b = torch.randn(100, 3, dtype=torch.float64) * 2 + 1
+    reference = DStandardScalerTensor(channels_last=True)
+    reference.fit(x_a)
+    reference.fit(x_b)
+
+    def make_legacy():
+        legacy = DStandardScalerTensor(channels_last=True)
+        legacy.fit(x_a)
+        legacy.n_ = 200
+        return legacy
+
+    sb = DStandardScalerTensor(channels_last=True)
+    sb.fit(x_b)
+    refit = make_legacy()
+    refit.fit(x_b)
+    for merged, label in ((make_legacy() + sb, "legacy + fit"), (sb + make_legacy(), "fit + legacy"),
+                          (refit, "legacy.fit")):
+        assert torch.equal(merged.n_, reference.n_), f"{label}: counts"
+        assert torch.allclose(merged.mean_x_, reference.mean_x_, rtol=1e-12, atol=0), f"{label}: mean"
+        assert torch.allclose(merged.var_x_, reference.var_x_, rtol=1e-12, atol=0), f"{label}: var"
+
+    # Two plain-number counts give a plain count back, not a crash.
+    a, b = make_legacy(), make_legacy()
+    b.n_ = 100
+    merged = a + b
+    assert merged.n_.item() == 300
+    assert torch.equal(merged.mean_x_, a.mean_x_)
+
+
+
 def test_dminmax_scaler_nan_aware():
     torch.manual_seed(1)
     n = 5000
