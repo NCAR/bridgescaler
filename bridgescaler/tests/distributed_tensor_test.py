@@ -211,8 +211,9 @@ def test_dstandard_scaler_merge_masked_channel():
 
 
 def test_dstandard_scaler_merge_unchanged_without_masking():
-    # Regression guard for the merge refactor: with data on both sides the combined moments must be
-    # exactly the original expression, bit for bit, not merely close to it.
+    # Regression guard for the merge refactor: with data on both sides the combined moments must match
+    # the original count-weighted expression. The merge now uses count fractions (so n_a * n_b is never
+    # formed), which changes the rounding, so this holds to a few ulps rather than bit for bit.
     torch.manual_seed(1)
     x_a = torch.randn(300, 4, dtype=torch.float64) * 5 + 2
     x_b = torch.randn(150, 4, dtype=torch.float64) * 5 + 2
@@ -229,8 +230,8 @@ def test_dstandard_scaler_merge_unchanged_without_masking():
                     + (n_a * n_b * (mean_a - mean_b) ** 2) / ((n_a + n_b) ** 2))
 
     merged = sa + sb
-    assert torch.equal(merged.mean_x_, expected_mean), "merged mean changed for unmasked data"
-    assert torch.equal(merged.var_x_, expected_var), "merged var changed for unmasked data"
+    assert torch.allclose(merged.mean_x_, expected_mean, rtol=1e-14, atol=0), "merged mean changed for unmasked data"
+    assert torch.allclose(merged.var_x_, expected_var, rtol=1e-14, atol=0), "merged var changed for unmasked data"
     assert torch.equal(merged.n_, n_a + n_b)
 
 
@@ -267,6 +268,74 @@ def test_dstandard_scaler_merge_scalar_count():
     assert merged.n_.item() == 300
     assert torch.equal(merged.mean_x_, a.mean_x_)
 
+
+
+
+def _merge_reference(n_a, mean_a, var_a, n_b, mean_b, var_b):
+    """Count-weighted merge in float64, used as the reference for the large-count tests."""
+    n_a, n_b = float(n_a), float(n_b)
+    n = n_a + n_b
+    mean = (n_a * mean_a + n_b * mean_b) / n
+    var = (n_a * var_a + n_b * var_b) / n + (n_a / n) * (n_b / n) * (mean_a - mean_b) ** 2
+    return mean, var
+
+
+def test_dstandard_scaler_large_count_precision():
+    # A long-running float32 fit: with float32 counts n_ + 64 == n_ once n_ is near 2**30, and float32
+    # stats cannot absorb an update of weight 64 / 2**30 ~ 6e-8. Counts are int64 and the stats float64,
+    # so the count stays exact and the merged stats match a float64 reference.
+    torch.manual_seed(5)
+    big_n = 2 ** 30 + 1
+    s = DStandardScalerTensor(channels_last=True)
+    s.fit(torch.randn(500, 3))
+    s.n_ = torch.full((3,), big_n, dtype=torch.int64)
+    mean_a, var_a = s.mean_x_.clone(), s.var_x_.clone()
+    x_b = torch.randn(64, 3) * 3 + 100
+    s.fit(x_b)
+    assert s.n_.dtype == torch.int64
+    assert torch.equal(s.n_, torch.full((3,), big_n + 64, dtype=torch.int64))
+    assert s.mean_x_.dtype == torch.float64 and s.var_x_.dtype == torch.float64
+    x_b64 = x_b.double()
+    ref_mean, ref_var = _merge_reference(big_n, mean_a, var_a, 64, x_b64.mean(0), x_b64.var(0, unbiased=False))
+    # The batch's own stats are reduced in float32; their rounding enters with weight 64 / 2**30, so
+    # 1e-9 is loose enough for that and far tighter than the ~1e-4 shift a stalled float32 merge misses.
+    torch.testing.assert_close(s.mean_x_, ref_mean, rtol=1e-9, atol=0)
+    torch.testing.assert_close(s.var_x_, ref_var, rtol=1e-9, atol=0)
+    assert (s.mean_x_ != mean_a).all(), "new data must move the mean"
+    # The output dtype still follows the input.
+    out = s.transform(x_b)
+    assert out.dtype == torch.float32
+    assert s.inverse_transform(out).dtype == torch.float32
+    assert s.transform(x_b64).dtype == torch.float64
+
+
+def test_dstandard_scaler_legacy_saved_counts(tmp_path):
+    # Scalers saved before counts were int64 hold float32 n_ and float32 stats (from a float32 fit), or a
+    # plain int n_. They must still load, merge, and refit, and come out as int64 / float64.
+    torch.manual_seed(6)
+    x_a = torch.randn(200, 3)
+    x_b = torch.randn(100, 3) * 2 + 1
+    reference = DStandardScalerTensor(channels_last=True)
+    reference.fit(x_a)
+    reference.fit(x_b)
+    for legacy_n in (torch.full((3,), 200.0, dtype=torch.float32), 200):
+        legacy = DStandardScalerTensor(channels_last=True)
+        legacy.fit(x_a)
+        legacy.n_ = legacy_n
+        legacy.mean_x_ = legacy.mean_x_.float()
+        legacy.var_x_ = legacy.var_x_.float()
+        path = tmp_path / "legacy.json"
+        save_scaler(legacy, path)
+        sb = DStandardScalerTensor(channels_last=True)
+        sb.fit(x_b)
+        refit = load_scaler(path)
+        refit.fit(x_b)
+        for merged in (load_scaler(path) + sb, sb + load_scaler(path), refit):
+            assert merged.n_.dtype == torch.int64 and torch.equal(merged.n_, reference.n_)
+            assert merged.mean_x_.dtype == torch.float64
+            torch.testing.assert_close(merged.mean_x_, reference.mean_x_, rtol=1e-6, atol=1e-7)
+            torch.testing.assert_close(merged.var_x_, reference.var_x_, rtol=1e-6, atol=1e-7)
+            assert merged.transform(x_b).dtype == torch.float32
 
 
 def test_dminmax_scaler_nan_aware():
@@ -906,7 +975,9 @@ def test_dspatial_standard_scaler_dtypes(dtype):
     x = _named((torch.randn(30, 2, 6, 8) * 50 + 1000).to(dtype), ["a", "b"])
     s = DSpatialStandardScalerTensor()
     s.fit(x)
-    assert s.mean_x_.dtype == dtype
+    # Stats are stored as float64 / int64 whatever the input dtype, so long fits keep their precision.
+    assert s.mean_x_.dtype == torch.float64 and s.var_x_.dtype == torch.float64
+    assert s.n_.dtype == torch.int64
     out = s.transform(x)
     assert out.dtype == dtype
     tol = 1e-4 if dtype == torch.float32 else 1e-10
@@ -990,3 +1061,52 @@ def test_dspatial_standard_scaler_speed():
         t_flat = bench(lambda: flat.transform(x_flat))
     print(f"\ntransform (1,1,1,{h},{w}): DSpatialStandardScalerTensor {t_spatial:.3f} ms, "
           f"flattened DStandardScalerTensor {t_flat:.3f} ms ({t_flat / t_spatial:.1f}x)")
+
+
+def test_dspatial_standard_scaler_large_count_precision():
+    # Same long-running float32 fit as test_dstandard_scaler_large_count_precision, per location.
+    torch.manual_seed(7)
+    names = ["a", "b"]
+    big_n = 2 ** 30 + 1
+    s = DSpatialStandardScalerTensor()
+    s.fit(_named(torch.randn(20, 2, 3, 4), names))
+    s.n_ = torch.full_like(s.n_, big_n)
+    mean_a, var_a = s.mean_x_.clone(), s.var_x_.clone()
+    x_b = torch.randn(64, 2, 3, 4) * 3 + 100
+    s.fit(_named(x_b.clone(), names))
+    assert s.n_.dtype == torch.int64 and (s.n_ == big_n + 64).all()
+    assert s.mean_x_.dtype == torch.float64 and s.var_x_.dtype == torch.float64
+    x_b64 = x_b.double()
+    ref_mean, ref_var = _merge_reference(big_n, mean_a, var_a, 64, x_b64.mean(0), x_b64.var(0, unbiased=False))
+    torch.testing.assert_close(s.mean_x_, ref_mean, rtol=1e-9, atol=0)
+    torch.testing.assert_close(s.var_x_, ref_var, rtol=1e-9, atol=0)
+    assert (s.mean_x_ != mean_a).all(), "new data must move the mean"
+    assert s.transform(_named(x_b.clone(), names)).dtype == torch.float32
+
+
+def test_dspatial_standard_scaler_legacy_saved_counts(tmp_path):
+    # A scaler saved with float32 n_ and float32 stats still loads, merges and refits.
+    torch.manual_seed(8)
+    names = ["a", "b"]
+    x_a = torch.randn(30, 2, 3, 4)
+    x_b = torch.randn(20, 2, 3, 4) * 2 + 1
+    reference = DSpatialStandardScalerTensor()
+    reference.fit(_named(x_a.clone(), names))
+    reference.fit(_named(x_b.clone(), names))
+    legacy = DSpatialStandardScalerTensor()
+    legacy.fit(_named(x_a.clone(), names))
+    legacy.n_ = legacy.n_.float()
+    legacy.mean_x_ = legacy.mean_x_.float()
+    legacy.var_x_ = legacy.var_x_.float()
+    path = tmp_path / "legacy_spatial.json"
+    save_scaler(legacy, path)
+    sb = DSpatialStandardScalerTensor()
+    sb.fit(_named(x_b.clone(), names))
+    refit = load_scaler(path)
+    refit.fit(_named(x_b.clone(), names))
+    for merged in (load_scaler(path) + sb, sb + load_scaler(path), refit):
+        assert merged.n_.dtype == torch.int64 and torch.equal(merged.n_, reference.n_)
+        assert merged.mean_x_.dtype == torch.float64
+        torch.testing.assert_close(merged.mean_x_, reference.mean_x_, rtol=1e-6, atol=1e-6)
+        torch.testing.assert_close(merged.var_x_, reference.var_x_, rtol=1e-6, atol=1e-6)
+        assert merged.transform(_named(x_b.clone(), names)).dtype == torch.float32

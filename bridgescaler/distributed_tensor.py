@@ -270,18 +270,48 @@ class DStandardScalerTensor(DBaseScalerTensor):
         position, so this masks NaNs out of the reduction instead of letting them propagate
         through a plain mean/var. An all-NaN channel naturally yields ``n=0`` and
         ``mean=var=nan`` with no special-casing required.
+
+        The reductions run in the input dtype, so the batch itself is never upcast. The count
+        is int64: a float32 count is exact only up to 2**24.
         """
         valid = ~torch.isnan(xv)
-        n = valid.sum(dim=reduce_dims).to(xv.dtype)
+        n = valid.sum(dim=reduce_dims)
         mean = torch.nanmean(xv, dim=reduce_dims)
         mean_b = reshape_fn(mean, xv)
         # torch.where, not valid * (xv - mean_b): 0 * nan is nan, so that would not zero anything.
         dev = torch.where(valid, xv - mean_b, torch.zeros_like(xv))
-        var = (dev ** 2).sum(dim=reduce_dims) / n
+        var = (dev ** 2).sum(dim=reduce_dims) / n.to(xv.dtype)
         return mean, var, n
 
     @staticmethod
+    def _stats_device(device: torch.device) -> torch.device:
+        """Device the float64 stats live on: MPS has no float64, so they stay on the CPU there."""
+        return torch.device("cpu") if device.type == "mps" else device
+
+    @classmethod
+    def _as_stats(
+        cls, mean: torch.Tensor, var: torch.Tensor, n: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return per-batch ``(mean, var, n)`` in the stored form: float64 moments, int64 counts."""
+        dev = cls._stats_device(mean.device)
+        return (mean.to(device=dev, dtype=torch.float64), var.to(device=dev, dtype=torch.float64),
+                n.to(device=dev, dtype=torch.int64))
+
+    @staticmethod
+    def _as_count(n: torch.Tensor | int | float, device: torch.device) -> torch.Tensor:
+        """Return a count as an int64 tensor on ``device``.
+
+        Scalers saved before counts were int64 hold float32 ``n_``, and hand-built ones may hold a
+        plain int or float; all of them are whole numbers.
+        """
+        if isinstance(n, float):
+            n = torch.tensor(n, dtype=torch.float64)
+        n = torch.as_tensor(n, device=device)
+        return n.round().to(torch.int64) if n.is_floating_point() else n.to(torch.int64)
+
+    @classmethod
     def _merge_moments(
+        cls,
         n_a: torch.Tensor | int | float,
         mean_a: torch.Tensor,
         var_a: torch.Tensor,
@@ -291,12 +321,19 @@ class DStandardScalerTensor(DBaseScalerTensor):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Combine two sets of per-channel (count, mean, variance) moments.
 
-        Used by both merge paths -- ``fit`` on an already-fit scaler and ``__add__`` --
-        so the two cannot drift apart.
+        Used by both merge paths -- ``fit`` on an already-fit scaler and ``__add__`` -- of
+        this scaler and of DSpatialStandardScalerTensor, so they cannot drift apart. The
+        result lives on ``mean_a``'s device (the CPU if that is MPS).
 
         A count may be a plain number rather than a per-channel tensor: scalers saved before
         the NaN-aware fit stored one total count, and scalers built by hand often set
         ``n_ = 1``. Such a count is applied to every channel.
+
+        Counts are combined as int64 and the moments in float64, whatever the inputs were.
+        The merge is written in terms of each side's fraction of the total, ``w = n / n_total``,
+        so ``n_a * n_b`` is never formed and cannot overflow. In float32 a long-running fit
+        stalls: once ``n_total`` passes 2**24 a float32 count stops growing, and once ``w_b``
+        drops below about 6e-8 the update ``w_b * (mean_b - mean_a)`` rounds away.
 
         A channel that saw only NaNs on one side comes out of ``_nan_aware_stats`` with
         ``n=0`` and ``mean=var=nan``. Weighting by the counts alone does not keep that
@@ -308,29 +345,32 @@ class DStandardScalerTensor(DBaseScalerTensor):
         (seasonal sea ice, say) and present in the next.
 
         A channel empty on *both* sides stays ``nan`` -- nothing has been observed there,
-        so there is no mean to report. Channels with data on both sides are unaffected:
-        the arithmetic is unchanged for them.
+        so there is no mean to report.
         """
-        # torch.where needs a tensor condition, so a plain-number count must become a tensor first.
-        n_a = torch.as_tensor(n_a, dtype=mean_a.dtype, device=mean_a.device)
-        n_b = torch.as_tensor(n_b, dtype=mean_b.dtype, device=mean_b.device)
+        dev = cls._stats_device(mean_a.device)
+        f64 = dict(dtype=torch.float64, device=dev)
+        n_a = cls._as_count(n_a, dev)
+        n_b = cls._as_count(n_b, dev)
+        mean_a, var_a = mean_a.to(**f64), var_a.to(**f64)
+        mean_b, var_b = mean_b.to(**f64), var_b.to(**f64)
         n_total = n_a + n_b
         a_empty = n_a == 0
         b_empty = n_b == 0
-        zero = torch.zeros((), dtype=mean_a.dtype, device=mean_a.device)
+        zero = torch.zeros((), **f64)
         mean_a = torch.where(a_empty, zero, mean_a)
         var_a = torch.where(a_empty, zero, var_a)
         mean_b = torch.where(b_empty, zero, mean_b)
         var_b = torch.where(b_empty, zero, var_b)
         # Channels empty on both sides would divide 0 by 0; they are set back to nan below.
-        denom = torch.where(n_total == 0, torch.ones_like(n_total), n_total)
-        mean = (n_a * mean_a + n_b * mean_b) / denom
-        var = (n_a * var_a + n_b * var_b) / denom
+        denom = torch.where(n_total == 0, torch.ones_like(n_total), n_total).to(torch.float64)
+        w_a = n_a.to(torch.float64) / denom
+        w_b = n_b.to(torch.float64) / denom
+        mean = w_a * mean_a + w_b * mean_b
         # The between-group correction reads both means, so it needs the zeroed ones too:
-        # with one side empty its n is 0 and the whole term vanishes, as it should.
-        var = var + (n_a * n_b * (mean_a - mean_b) ** 2) / denom ** 2
+        # with one side empty its weight is 0 and the whole term vanishes, as it should.
+        var = w_a * var_a + w_b * var_b + w_a * w_b * (mean_a - mean_b) ** 2
         both_empty = a_empty & b_empty
-        nan = torch.full((), float("nan"), dtype=mean.dtype, device=mean.device)
+        nan = torch.full((), float("nan"), **f64)
         mean = torch.where(both_empty, nan, mean)
         var = torch.where(both_empty, nan, var)
         return n_total, mean, var
@@ -343,7 +383,7 @@ class DStandardScalerTensor(DBaseScalerTensor):
         reshape_fn = self.reshape_to_channels_last if self.channels_last else self.reshape_to_channels_first
         if not self._fit:
             self.x_columns_ = x_columns
-            self.mean_x_, self.var_x_, self.n_ = self._nan_aware_stats(xv, reduce_dims, reshape_fn)
+            self.mean_x_, self.var_x_, self.n_ = self._as_stats(*self._nan_aware_stats(xv, reduce_dims, reshape_fn))
         else:
             # Update existing scaler with new data
             assert (
@@ -380,10 +420,10 @@ class DStandardScalerTensor(DBaseScalerTensor):
         x_mean, x_var = self.get_scales(x_col_order)
         if channels_last:
             x_transformed = (
-                    xv - self.reshape_to_channels_last(x_mean.to(device=xv.device), xv)) / torch.sqrt(self.reshape_to_channels_last(x_var.to(device=xv.device), xv))
+                    xv - self.reshape_to_channels_last(x_mean.to(device=xv.device, dtype=xv.dtype), xv)) / torch.sqrt(self.reshape_to_channels_last(x_var.to(device=xv.device, dtype=xv.dtype), xv))
         else:
             x_transformed = (
-                    xv - self.reshape_to_channels_first(x_mean.to(device=xv.device), xv)) / torch.sqrt(self.reshape_to_channels_first(x_var.to(device=xv.device), xv))
+                    xv - self.reshape_to_channels_first(x_mean.to(device=xv.device, dtype=xv.dtype), xv)) / torch.sqrt(self.reshape_to_channels_first(x_var.to(device=xv.device, dtype=xv.dtype), xv))
         x_transformed_final = self.package_transformed_x(x_transformed, x)
         return x_transformed_final
 
@@ -398,10 +438,10 @@ class DStandardScalerTensor(DBaseScalerTensor):
         x_mean, x_var = self.get_scales(x_col_order)
         if channels_last:
             x_transformed = xv * \
-                    torch.sqrt(self.reshape_to_channels_last(x_var.to(device=xv.device), xv)) + self.reshape_to_channels_last(x_mean.to(device=xv.device), xv)
+                    torch.sqrt(self.reshape_to_channels_last(x_var.to(device=xv.device, dtype=xv.dtype), xv)) + self.reshape_to_channels_last(x_mean.to(device=xv.device, dtype=xv.dtype), xv)
         else:
             x_transformed = xv * \
-                    torch.sqrt(self.reshape_to_channels_first(x_var.to(device=xv.device), xv)) + self.reshape_to_channels_first(x_mean.to(device=xv.device), xv)
+                    torch.sqrt(self.reshape_to_channels_first(x_var.to(device=xv.device, dtype=xv.dtype), xv)) + self.reshape_to_channels_first(x_mean.to(device=xv.device, dtype=xv.dtype), xv)
         x_transformed_final = self.package_transformed_x(x_transformed, x)
         return x_transformed_final
 
@@ -443,7 +483,9 @@ class DSpatialStandardScalerTensor(DBaseScalerTensor):
 
     Like the other distributed scalers it can be fit map-reduce style: fit one scaler per chunk and sum
     them with ``+``, or call ``fit`` repeatedly on one scaler. Both use the elementwise Chan et al.
-    parallel mean/variance merge. Variances are population variances (divide by n).
+    parallel mean/variance merge (``DStandardScalerTensor._merge_moments``). Variances are population
+    variances (divide by n). Counts are stored as int64 and mean/variance as float64, so long-running
+    fits keep their precision; ``transform`` still returns the input's dtype.
 
     Locations with zero variance (a constant field) are scaled with a standard deviation of 1, so
     ``transform`` returns ``x - mean`` there instead of inf/NaN. Locations with NaN statistics stay NaN.
@@ -522,23 +564,6 @@ class DSpatialStandardScalerTensor(DBaseScalerTensor):
                 f"{list(_as_int_tuple(self.spatial_shape_))}."
             )
 
-    @staticmethod
-    def _chan_merge(n_a, mean_a, var_a, n_b, mean_b, var_b):
-        """Elementwise Chan et al. merge of two sets of (count, mean, population variance).
-
-        Locations with a zero count on one side (all-NaN there) take the other side's statistics as-is, so
-        a NaN mean from an empty side does not poison a location that has data elsewhere.
-        """
-        n = n_a + n_b
-        delta = mean_b - mean_a
-        mean = mean_a + delta * (n_b / n)
-        var = (n_a * var_a + n_b * var_b) / n + n_a * n_b * delta ** 2 / n ** 2
-        a_empty = n_a == 0
-        b_empty = n_b == 0
-        mean = torch.where(a_empty, mean_b, torch.where(b_empty, mean_a, mean))
-        var = torch.where(a_empty, var_b, torch.where(b_empty, var_a, var))
-        return n, mean, var
-
     def fit(self, x, weight=None):
         """
         Fit (or update) the per-location statistics with the data in ``x``.
@@ -563,7 +588,7 @@ class DSpatialStandardScalerTensor(DBaseScalerTensor):
         if not self._fit:
             self.x_columns_ = x_columns
             self.spatial_shape_ = spatial_shape
-            self.mean_x_, self.var_x_, self.n_ = new_mean, new_var, new_n
+            self.mean_x_, self.var_x_, self.n_ = DStandardScalerTensor._as_stats(new_mean, new_var, new_n)
         else:
             if x.shape[channel_dim] != len(self.x_columns_):
                 raise ValueError(
@@ -578,9 +603,8 @@ class DSpatialStandardScalerTensor(DBaseScalerTensor):
                 new_mean = new_mean.index_select(0, perm)
                 new_var = new_var.index_select(0, perm)
                 new_n = new_n.index_select(0, perm)
-            dev = self.mean_x_.device
-            self.n_, self.mean_x_, self.var_x_ = self._chan_merge(
-                self.n_, self.mean_x_, self.var_x_, new_n.to(dev), new_mean.to(dev), new_var.to(dev))
+            self.n_, self.mean_x_, self.var_x_ = DStandardScalerTensor._merge_moments(
+                self.n_, self.mean_x_, self.var_x_, new_n, new_mean, new_var)
         self.spatial_dims = list(_as_int_tuple(self.spatial_dims))
         self._fit = True
 
@@ -660,10 +684,8 @@ class DSpatialStandardScalerTensor(DBaseScalerTensor):
                 f"Scaler spatial shapes do not match: {list(_as_int_tuple(self.spatial_shape_))} vs "
                 f"{list(_as_int_tuple(other.spatial_shape_))}."
             )
-        dev = self.mean_x_.device
-        current.n_, current.mean_x_, current.var_x_ = self._chan_merge(
-            self.n_, self.mean_x_, self.var_x_,
-            other.n_.to(dev), other.mean_x_.to(dev), other.var_x_.to(dev))
+        current.n_, current.mean_x_, current.var_x_ = DStandardScalerTensor._merge_moments(
+            self.n_, self.mean_x_, self.var_x_, other.n_, other.mean_x_, other.var_x_)
         return current
 
     def subset_columns(self, sel_columns):

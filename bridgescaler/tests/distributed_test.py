@@ -1,6 +1,7 @@
 from bridgescaler.distributed import DStandardScaler, DMinMaxScaler, DQuantileScaler
 from bridgescaler import save_scaler, load_scaler, print_scaler, read_scaler
 import numpy as np
+import pytest
 import pandas as pd
 import xarray as xr
 import os
@@ -183,8 +184,9 @@ def test_dstandard_scaler_merge_masked_columns():
 
 
 def test_dstandard_scaler_merge_unchanged_without_masking():
-    # Regression guard for the merge refactor: with no NaNs the combined moments must be exactly the
-    # original expression, bit for bit, not merely close to it.
+    # Regression guard for the merge refactor: with no NaNs the combined moments must match the original
+    # count-weighted expression. The merge now uses count fractions (so n_a * n_b is never formed), which
+    # changes the rounding, so this holds to a few ulps rather than bit for bit.
     rng = np.random.default_rng(1)
     x_a = rng.normal(2, 5, (300, 4))
     x_b = rng.normal(2, 5, (150, 4))
@@ -199,8 +201,8 @@ def test_dstandard_scaler_merge_unchanged_without_masking():
     refit = deepcopy(sa)
     refit.fit(x_b)
     for merged in (sa + sb, refit):
-        np.testing.assert_array_equal(merged.mean_x_, expected_mean)
-        np.testing.assert_array_equal(merged.var_x_, expected_var)
+        np.testing.assert_allclose(merged.mean_x_, expected_mean, rtol=1e-14, atol=0)
+        np.testing.assert_allclose(merged.var_x_, expected_var, rtol=1e-14, atol=0)
         np.testing.assert_array_equal(merged.n_, np.full(4, n_a + n_b))
 
 
@@ -230,6 +232,27 @@ def test_dstandard_scaler_legacy_scalar_count(tmp_path):
     loaded = load_scaler(path)
     np.testing.assert_array_equal(loaded.n_, reference.n_)
     np.testing.assert_array_equal(loaded.mean_x_, reference.mean_x_)
+
+
+
+@pytest.mark.parametrize("scaler_class", [DStandardScaler, DMinMaxScaler, DQuantileScaler])
+def test_loaded_scaler_can_refit(tmp_path, scaler_class):
+    # load_scaler decodes arrays from base64 bytes; they must come back writeable, or refitting a loaded
+    # scaler fails on its in-place updates.
+    rng = np.random.default_rng(4)
+    x_a = rng.normal(0, 1, (200, 3))
+    x_b = rng.normal(1, 2, (100, 3))
+    never_saved = scaler_class()
+    never_saved.fit(x_a)
+    path = tmp_path / "scaler.json"
+    save_scaler(never_saved, path)
+    loaded = load_scaler(path)
+    never_saved.fit(x_b)
+    loaded.fit(x_b)
+    np.testing.assert_array_equal(loaded.transform(x_b), never_saved.transform(x_b))
+    for attr in ("n_", "mean_x_", "var_x_", "min_x_", "max_x_"):
+        if hasattr(never_saved, attr):
+            np.testing.assert_array_equal(getattr(loaded, attr), getattr(never_saved, attr))
 
 
 def test_dstandard_scaler_merge_keeps_dtype():
