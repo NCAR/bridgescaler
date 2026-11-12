@@ -82,13 +82,17 @@ jobs:
         include:
           - label: conda-forge
             python: '3.13'
-            conda-packages: numba pytorch
+            conda-packages: numpy scipy pandas scikit-learn xarray pyarrow pytest setuptools-scm numba pytorch
             pip-packages: ''
-          # The package versions from issue #44 (pip numba/llvmlite/torch on top of conda-forge llvm-openmp).
+          # The environment from issue #44: only python and llvm-openmp come from conda-forge, everything else
+          # from pip. The pip scikit-learn wheel bundles its own libomp, so numba's omp layer then runs with two
+          # OpenMP runtimes loaded in the process.
           - label: issue-44-stack
-            python: '3.11'
-            conda-packages: llvm-openmp=21.1.8 numpy=2.3.5
-            pip-packages: numba==0.63.1 llvmlite==0.46.0 torch==2.10.0
+            python: '3.11.14'
+            conda-packages: llvm-openmp=21.1.8
+            pip-packages: >-
+              numba==0.63.1 llvmlite==0.46.0 numpy==2.3.5 scipy==1.17.0 scikit-learn==1.8.0 pandas==3.0.0
+              xarray==2025.12.0 pyarrow torch==2.10.0 pytest setuptools-scm
     env:
       PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0"
     defaults:
@@ -106,12 +110,12 @@ jobs:
           conda-remove-defaults: "true"
       - name: Install dependencies
         run: |
-          conda install -y scipy pandas scikit-learn xarray pyarrow pytest setuptools-scm ${{ matrix.conda-packages }}
+          conda install -y ${{ matrix.conda-packages }}
           if [ -n "${{ matrix.pip-packages }}" ]; then
             python -m pip install ${{ matrix.pip-packages }}
           fi
           python -m pip install .
-          conda list | grep -Ei "numba|llvmlite|openmp|numpy|torch"
+          conda list | grep -Ei "numba|llvmlite|openmp|numpy|scikit|torch"
       - name: Environment info
         run: python .github/ci_env_info.py
       - name: Test with pytest
