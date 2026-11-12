@@ -1,9 +1,13 @@
 import os
+import subprocess
+import sys
+import textwrap
 
 import numpy as np
 import pytest
 
 import tdigest_cases as tc
+import bridgescaler
 from bridgescaler.tdigest import TDigest
 from bridgescaler.distributed import DQuantileScaler, tdigest_cdf, tdigest_quantile
 
@@ -282,3 +286,53 @@ def test_dquantile_scaler_add_subset_columns():
         ref = tc.to_state(td)
         assert_state_equal((combined.centroids_[i], combined.size_[i], combined.min_[i], combined.max_[i]),
                            ref[0], np.array(ref[1:]), col)
+
+
+# Run in a child process so a crash inside a numba kernel fails one test instead of killing pytest.
+_THREADING_LAYER_SCRIPT = textwrap.dedent("""
+    import sys
+    import numpy as np
+    import numba
+    from bridgescaler.tdigest import TDigest, TDigestArrays
+
+    rng = np.random.default_rng(44)
+    # The shape and compression from issue #44, which segfaulted under the omp layer on macOS.
+    x = rng.random((2, 4, 121, 240))
+    other = rng.random((2, 4, 121, 240))
+    try:
+        fit = TDigestArrays.fit(x, compression=500.0, channel_axis=1)
+    except ValueError as err:
+        if "threading layer" in str(err):
+            print(err)
+            sys.exit(3)
+        raise
+    fit.merge(TDigestArrays.fit(other, compression=500.0, channel_axis=1))
+    centroids, sizes, mins, maxs = fit.to_states()
+    for i in range(x.shape[1]):
+        td = TDigest(500.0)
+        td.update(x[:, i])
+        td.centroids()  # flush, as TDigestArrays.fit does
+        td2 = TDigest(500.0)
+        td2.update(other[:, i])
+        td.merge(td2)
+        c = td.centroids()
+        assert np.array_equal(centroids[i], np.stack([c["mean"], c["weight"]], axis=1)), i
+        assert sizes[i] == td.size() and mins[i] == td.min() and maxs[i] == td.max(), i
+    print("layer", numba.threading_layer())
+""")
+
+
+@pytest.mark.parametrize("layer", ["omp", "workqueue", "tbb"])
+def test_tdigest_arrays_threading_layers(layer, tmp_path):
+    """The parallel fit and merge kernels run and match the serial TDigest under every numba threading layer
+    that loads here (issue #44: a segfault under the omp layer on macOS)."""
+    env = dict(os.environ, NUMBA_THREADING_LAYER=layer, NUMBA_CACHE_DIR=str(tmp_path / "numba_cache"))
+    package_root = os.path.dirname(os.path.dirname(os.path.abspath(bridgescaler.__file__)))
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [package_root, env.get("PYTHONPATH")]))
+    proc = subprocess.run([sys.executable, "-c", _THREADING_LAYER_SCRIPT], env=env, capture_output=True, text=True,
+                          timeout=600)
+    if proc.returncode == 3:
+        pytest.skip(f"numba threading layer {layer!r} is not available: {proc.stdout.strip()}")
+    assert proc.returncode == 0, (f"child exited with {proc.returncode} under NUMBA_THREADING_LAYER={layer}\n"
+                                  f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+    assert f"layer {layer}" in proc.stdout

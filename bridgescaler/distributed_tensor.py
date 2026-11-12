@@ -288,14 +288,24 @@ class DStandardScalerTensor(DBaseScalerTensor):
         """Device the float64 stats live on: MPS has no float64, so they stay on the CPU there."""
         return torch.device("cpu") if device.type == "mps" else device
 
+    @staticmethod
+    def _to_stats(t: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """Move ``t`` to ``device``, then cast it to ``dtype``, in two separate steps.
+
+        A combined ``t.to(device="cpu", dtype=torch.float64)`` on an MPS tensor is broken in
+        torch: up to 2.13 it raises (MPS has no float64), and in 2.14 it silently returns zeros.
+        Moving first and casting on the destination device avoids both.
+        """
+        return t.to(device).to(dtype)
+
     @classmethod
     def _as_stats(
         cls, mean: torch.Tensor, var: torch.Tensor, n: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return per-batch ``(mean, var, n)`` in the stored form: float64 moments, int64 counts."""
         dev = cls._stats_device(mean.device)
-        return (mean.to(device=dev, dtype=torch.float64), var.to(device=dev, dtype=torch.float64),
-                n.to(device=dev, dtype=torch.int64))
+        return (cls._to_stats(mean, dev, torch.float64), cls._to_stats(var, dev, torch.float64),
+                cls._to_stats(n, dev, torch.int64))
 
     @staticmethod
     def _as_count(n: torch.Tensor | int | float, device: torch.device) -> torch.Tensor:
@@ -351,8 +361,8 @@ class DStandardScalerTensor(DBaseScalerTensor):
         f64 = dict(dtype=torch.float64, device=dev)
         n_a = cls._as_count(n_a, dev)
         n_b = cls._as_count(n_b, dev)
-        mean_a, var_a = mean_a.to(**f64), var_a.to(**f64)
-        mean_b, var_b = mean_b.to(**f64), var_b.to(**f64)
+        mean_a, var_a = cls._to_stats(mean_a, dev, torch.float64), cls._to_stats(var_a, dev, torch.float64)
+        mean_b, var_b = cls._to_stats(mean_b, dev, torch.float64), cls._to_stats(var_b, dev, torch.float64)
         n_total = n_a + n_b
         a_empty = n_a == 0
         b_empty = n_b == 0
