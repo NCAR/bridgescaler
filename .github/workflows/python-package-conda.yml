@@ -34,7 +34,9 @@ jobs:
       PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0"
     defaults:
       run:
-        shell: bash -l {0}
+        # Not a login shell: on macOS that reorders PATH so Homebrew's (externally managed) Python shadows
+        # the one from setup-python, and `uv pip install --system` then refuses to install (PEP 668).
+        shell: bash
     steps:
       - uses: actions/checkout@v6
       - name: Setup Python
