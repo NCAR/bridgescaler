@@ -40,7 +40,10 @@ crick is distributed under the BSD 3-Clause license:
     OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 import math
+import sys
+from concurrent.futures import ThreadPoolExecutor
 
+import numba
 import numpy as np
 from numba import njit, prange
 
@@ -452,46 +455,122 @@ class TDigest(object):
             self._istate[I_NCENTROIDS] = n
 
 
+@njit(cache=True)
+def _padded_copy(row):
+    """Copy a small state row into its own array of at least 128 bytes.
+
+    Neighbouring channels' ``fstate``/``istate`` rows (40 and 16 bytes) share cache lines and are written for every
+    value added, so threads updating neighbouring channels in place keep invalidating each other's caches (false
+    sharing), which made the thread-pool fit several times slower. Working on a padded private copy avoids that."""
+    out = np.empty(max(row.shape[0], 16), dtype=row.dtype)
+    out[:row.shape[0]] = row
+    return out
+
+
+@njit(cache=True)
+def _fit_channel(x, i, fstate, istate, c_mean, c_weight, m_mean, m_weight, b_mean, b_weight, s_mean, s_weight):
+    """Fit digest ``i`` from the values ``x[:, i, :]`` of ``x`` (shape ``(A, C, K)``) in C order, running the same
+    sequential kernels as ``TDigest.update`` on its own state row."""
+    n_a, n_c, n_k = x.shape
+    # per-channel row views, created once rather than for every value
+    fs, ist = _padded_copy(fstate[i]), _padded_copy(istate[i])
+    cm, cw, mm, mw = c_mean[i], c_weight[i], m_mean[i], m_weight[i]
+    bm, bw, sm, sw = b_mean[i], b_weight[i], s_mean[i], s_weight[i]
+    for a in range(n_a):
+        for k in range(n_k):
+            _add(fs, ist, cm, cw, mm, mw, bm, bw, sm, sw, np.float64(x[a, i, k]), 1.0)
+    _flush(fs, ist, cm, cw, mm, mw, bm, bw, sm, sw)
+    fstate[i] = fs[:fstate.shape[1]]
+    istate[i] = ist[:istate.shape[1]]
+
+
+@njit(cache=True)
+def _merge_channel(j, targets, fstate, istate, c_mean, c_weight, m_mean, m_weight, b_mean, b_weight, s_mean,
+                   s_weight, o_fstate, o_istate, o_mean, o_weight):
+    """Merge flushed digest ``j`` of the other batch into digest ``targets[j]`` (``TDigest.merge``)."""
+    i = targets[j]
+    fs, ist = _padded_copy(fstate[i]), _padded_copy(istate[i])  # see _padded_copy
+    cm, cw, mm, mw = c_mean[i], c_weight[i], m_mean[i], m_weight[i]
+    bm, bw, sm, sw = b_mean[i], b_weight[i], s_mean[i], s_weight[i]
+    if o_fstate[j, F_TOTAL_WEIGHT] != 0:
+        for k in range(o_istate[j, I_NCENTROIDS]):
+            _add(fs, ist, cm, cw, mm, mw, bm, bw, sm, sw, o_mean[j, k], o_weight[j, k])
+        if fs[F_MIN] > o_fstate[j, F_MIN]:
+            fs[F_MIN] = o_fstate[j, F_MIN]
+        if fs[F_MAX] < o_fstate[j, F_MAX]:
+            fs[F_MAX] = o_fstate[j, F_MAX]
+    _flush(fs, ist, cm, cw, mm, mw, bm, bw, sm, sw)
+    fstate[i] = fs[:fstate.shape[1]]
+    istate[i] = ist[:istate.shape[1]]
+
+
 @njit(parallel=True, cache=True)
 def _fit_batch_kernel(x, fstate, istate, c_mean, c_weight, m_mean, m_weight, b_mean, b_weight, s_mean, s_weight):
-    """Fit one digest per channel ``i`` of ``x`` (shape ``(A, C, K)``) from the values ``x[:, i, :]`` in C order,
-    in parallel over channels. Each channel runs the same sequential kernels as ``TDigest.update`` on its own state
-    row, so the result is identical to fitting the channels one at a time."""
-    n_a, n_c, n_k = x.shape
-    for i in prange(n_c):
-        # per-channel row views, created once rather than for every value
-        fs, ist, cm, cw, mm, mw = fstate[i], istate[i], c_mean[i], c_weight[i], m_mean[i], m_weight[i]
-        bm, bw, sm, sw = b_mean[i], b_weight[i], s_mean[i], s_weight[i]
-        for a in range(n_a):
-            for k in range(n_k):
-                _add(fs, ist, cm, cw, mm, mw, bm, bw, sm, sw, np.float64(x[a, i, k]), 1.0)
-        _flush(fs, ist, cm, cw, mm, mw, bm, bw, sm, sw)
+    """Fit one digest per channel of ``x`` (shape ``(A, C, K)``) in parallel over channels with ``prange``. Each
+    channel is fit independently, so the result is identical to fitting the channels one at a time."""
+    for i in prange(x.shape[1]):
+        _fit_channel(x, i, fstate, istate, c_mean, c_weight, m_mean, m_weight, b_mean, b_weight, s_mean, s_weight)
 
 
 @njit(parallel=True, cache=True)
 def _merge_batch_kernel(targets, fstate, istate, c_mean, c_weight, m_mean, m_weight, b_mean, b_weight, s_mean,
                         s_weight, o_fstate, o_istate, o_mean, o_weight):
-    """Merge flushed digest ``j`` of the other batch into digest ``targets[j]`` (``TDigest.merge``), in parallel.
-    ``targets`` must not repeat."""
+    """``_merge_channel`` for every digest of the other batch, in parallel with ``prange``. ``targets`` must not
+    repeat."""
     for j in prange(targets.shape[0]):
-        i = targets[j]
-        fs, ist, cm, cw, mm, mw = fstate[i], istate[i], c_mean[i], c_weight[i], m_mean[i], m_weight[i]
-        bm, bw, sm, sw = b_mean[i], b_weight[i], s_mean[i], s_weight[i]
-        if o_fstate[j, F_TOTAL_WEIGHT] != 0:
-            for k in range(o_istate[j, I_NCENTROIDS]):
-                _add(fs, ist, cm, cw, mm, mw, bm, bw, sm, sw, o_mean[j, k], o_weight[j, k])
-            if fs[F_MIN] > o_fstate[j, F_MIN]:
-                fs[F_MIN] = o_fstate[j, F_MIN]
-            if fs[F_MAX] < o_fstate[j, F_MAX]:
-                fs[F_MAX] = o_fstate[j, F_MAX]
-        _flush(fs, ist, cm, cw, mm, mw, bm, bw, sm, sw)
+        _merge_channel(j, targets, fstate, istate, c_mean, c_weight, m_mean, m_weight, b_mean, b_weight, s_mean,
+                       s_weight, o_fstate, o_istate, o_mean, o_weight)
+
+
+@njit(nogil=True, cache=True)
+def _fit_channels(channels, x, fstate, istate, c_mean, c_weight, m_mean, m_weight, b_mean, b_weight, s_mean,
+                  s_weight):
+    """``_fit_channel`` for each index in ``channels``, sequentially and without the GIL (one thread-pool task)."""
+    for c in range(channels.shape[0]):
+        _fit_channel(x, channels[c], fstate, istate, c_mean, c_weight, m_mean, m_weight, b_mean, b_weight, s_mean,
+                     s_weight)
+
+
+@njit(nogil=True, cache=True)
+def _merge_channels(js, targets, fstate, istate, c_mean, c_weight, m_mean, m_weight, b_mean, b_weight, s_mean,
+                    s_weight, o_fstate, o_istate, o_mean, o_weight):
+    """``_merge_channel`` for each index in ``js``, sequentially and without the GIL (one thread-pool task)."""
+    for c in range(js.shape[0]):
+        _merge_channel(js[c], targets, fstate, istate, c_mean, c_weight, m_mean, m_weight, b_mean, b_weight, s_mean,
+                       s_weight, o_fstate, o_istate, o_mean, o_weight)
+
+
+# How TDigestArrays runs its per-channel kernels in parallel:
+#   "numba"   -- numba ``prange`` kernels, which run on numba's threading layer (tbb, omp or workqueue).
+#   "threads" -- nogil numba kernels over a Python thread pool, which never starts numba's threading layer.
+# macOS uses "threads": with numba's omp layer, a process that has also loaded another libomp (for example the one
+# bundled in the pip scikit-learn wheel, which bridgescaler imports) can segfault on the first parallel call, even
+# for a trivial prange loop (issue #44). Both modes give bit-identical results.
+PARALLEL_MODE = "threads" if sys.platform == "darwin" else "numba"
+
+
+def _run_in_threads(kernel, n, *args):
+    """Call ``kernel(indices, *args)`` on contiguous chunks of ``range(n)`` across a thread pool sized like numba's
+    thread count (``NUMBA_NUM_THREADS``). Reading the config, unlike ``numba.get_num_threads()``, does not start
+    numba's threading layer.
+
+    The chunks are contiguous, like ``prange``'s static schedule, so each thread works through neighbouring rows of
+    the larger state arrays (see ``_padded_copy`` for the small ones)."""
+    n_threads = max(1, min(n, numba.config.NUMBA_NUM_THREADS))
+    chunks = np.array_split(np.arange(n, dtype=np.int64), n_threads)
+    if n_threads == 1:
+        kernel(chunks[0], *args)
+        return
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        for future in [pool.submit(kernel, chunk, *args) for chunk in chunks]:
+            future.result()
 
 
 class TDigestArrays(object):
     """
     A batch of ``C`` digests (one per channel) sharing one compression, stored as stacked numpy arrays and fit or
-    merged in parallel over channels with numba ``prange``. Results are identical to using one ``TDigest`` per
-    channel. The state is kept flushed between calls.
+    merged in parallel over channels (numba ``prange``, or a thread pool on macOS; see ``PARALLEL_MODE``). Results
+    are identical to using one ``TDigest`` per channel. The state is kept flushed between calls.
 
     Args:
         n (int): number of digests.
@@ -540,7 +619,10 @@ class TDigestArrays(object):
         x3 = x.reshape(int(np.prod(x.shape[:axis], dtype=np.int64)), n, -1) if x.size else x.reshape(0, n, 0)
         out = TDigestArrays(n, compression)
         if x.size:
-            _fit_batch_kernel(x3, *out._arrays())
+            if PARALLEL_MODE == "threads":
+                _run_in_threads(_fit_channels, n, x3, *out._arrays())
+            else:
+                _fit_batch_kernel(x3, *out._arrays())
         return out
 
     @staticmethod
@@ -585,5 +667,9 @@ class TDigestArrays(object):
         targets = np.arange(len(other)) if targets is None else np.asarray(targets, dtype=np.int64)
         if targets.shape[0] != len(other) or np.unique(targets).size != targets.size:
             raise ValueError("targets must hold one distinct index per digest in other.")
-        _merge_batch_kernel(targets, *self._arrays(), other._fstate, other._istate, other._c_mean, other._c_weight)
+        args = (targets, *self._arrays(), other._fstate, other._istate, other._c_mean, other._c_weight)
+        if PARALLEL_MODE == "threads":
+            _run_in_threads(_merge_channels, targets.shape[0], *args)
+        else:
+            _merge_batch_kernel(*args)
         return self

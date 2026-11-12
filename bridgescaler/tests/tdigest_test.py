@@ -219,9 +219,17 @@ def test_tdigest_api_edge_cases():
     assert np.array_equal(clone.centroids(), td.centroids()) and clone.size() == td.size()
 
 
+@pytest.fixture(params=["numba", "threads"])
+def parallel_mode(request, monkeypatch):
+    """Run a test with TDigestArrays in each parallel mode, whatever this platform's default is."""
+    import bridgescaler.tdigest
+    monkeypatch.setattr(bridgescaler.tdigest, "PARALLEL_MODE", request.param)
+    return request.param
+
+
 @pytest.mark.parametrize("channel_axis", [-1, 1])
 @pytest.mark.parametrize("dtype", [np.float64, np.float32])
-def test_tdigest_arrays_match_per_channel(channel_axis, dtype):
+def test_tdigest_arrays_match_per_channel(channel_axis, dtype, parallel_mode):
     """The prange batch fit/merge equals one TDigest per channel, fit on ``np.take(x, i, axis).ravel()``."""
     from bridgescaler.tdigest import TDigestArrays
     rng = np.random.default_rng(4)
@@ -244,7 +252,7 @@ def test_tdigest_arrays_match_per_channel(channel_axis, dtype):
                            np.array(tc.to_state(td)[1:]), f"channel {i}")
 
 
-def test_tdigest_arrays_merge_targets():
+def test_tdigest_arrays_merge_targets(parallel_mode):
     from bridgescaler.tdigest import TDigestArrays
     rng = np.random.default_rng(6)
     x = rng.normal(size=(5000, 5))
@@ -318,14 +326,19 @@ _THREADING_LAYER_SCRIPT = textwrap.dedent("""
         c = td.centroids()
         assert np.array_equal(centroids[i], np.stack([c["mean"], c["weight"]], axis=1)), i
         assert sizes[i] == td.size() and mins[i] == td.min() and maxs[i] == td.max(), i
-    print("layer", numba.threading_layer())
+    try:
+        print("layer", numba.threading_layer())
+    except ValueError:  # the thread-pool mode never starts numba's threading layer
+        print("layer none")
 """)
 
 
 @pytest.mark.parametrize("layer", ["omp", "workqueue", "tbb"])
 def test_tdigest_arrays_threading_layers(layer, tmp_path):
-    """The parallel fit and merge kernels run and match the serial TDigest under every numba threading layer
-    that loads here (issue #44: a segfault under the omp layer on macOS)."""
+    """TDigestArrays fit and merge run and match the serial TDigest whatever NUMBA_THREADING_LAYER is set to.
+
+    Issue #44: on macOS, numba's omp layer segfaulted when another libomp (pip scikit-learn's) was already loaded,
+    so there TDigestArrays uses a thread pool and must not start numba's threading layer at all."""
     env = dict(os.environ, NUMBA_THREADING_LAYER=layer, NUMBA_CACHE_DIR=str(tmp_path / "numba_cache"))
     package_root = os.path.dirname(os.path.dirname(os.path.abspath(bridgescaler.__file__)))
     env["PYTHONPATH"] = os.pathsep.join(filter(None, [package_root, env.get("PYTHONPATH")]))
@@ -335,4 +348,6 @@ def test_tdigest_arrays_threading_layers(layer, tmp_path):
         pytest.skip(f"numba threading layer {layer!r} is not available: {proc.stdout.strip()}")
     assert proc.returncode == 0, (f"child exited with {proc.returncode} under NUMBA_THREADING_LAYER={layer}\n"
                                   f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
-    assert f"layer {layer}" in proc.stdout
+    from bridgescaler.tdigest import PARALLEL_MODE
+    expected = "layer none" if PARALLEL_MODE == "threads" else f"layer {layer}"
+    assert expected in proc.stdout, proc.stdout

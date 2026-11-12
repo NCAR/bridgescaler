@@ -1141,7 +1141,7 @@ class DQuantileScalerTensor(DBaseScalerTensor):
             otherwise. Must be >= 4.
         fit_backend: How the TDigests are fit; both give bit-identical results. ``"numba"`` (default) copies the
             data to the CPU and fits all variables in parallel with ``bridgescaler.tdigest`` (numba ``prange``
-            over variables). ``"torch"`` (opt-in) fits all variables at once on the data's device with
+            over variables, or a thread pool on macOS). ``"torch"`` (opt-in) fits all variables at once on the data's device with
             ``bridgescaler.tdigest_tensor`` (CPU or CUDA; MPS data is fit on the CPU since MPS has no float64),
             using ``torch.compile`` (with CUDA graphs on CUDA) when ``compile`` is True. Eager torch issues ~150
             small kernels per flush and is only practical on CPU. Compiled CUDA takes minutes to compile per
