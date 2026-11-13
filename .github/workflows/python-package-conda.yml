@@ -71,28 +71,11 @@ jobs:
           pytest -rs
 
   test-macos-conda:
-    # conda-forge numba links llvm-openmp, so numba picks its omp threading layer: the setup in which
-    # TDigestArrays.fit segfaulted in issue #44. macos-15 is the macOS release that issue was reported on.
-    name: conda / macos-15 / ${{ matrix.label }}
+    # conda-forge numba links llvm-openmp, so numba can use its omp threading layer here, which the pip job
+    # cannot. macos-15 complements the pip job's macos-latest.
+    name: conda / macos-15
     runs-on: macos-15
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: conda-forge
-            python: '3.13'
-            conda-packages: numpy scipy pandas scikit-learn xarray pyarrow pytest setuptools-scm numba pytorch
-            pip-packages: ''
-          # The environment from issue #44: only python and llvm-openmp come from conda-forge, everything else
-          # from pip. The pip scikit-learn wheel bundles its own libomp, so numba's omp layer then runs with two
-          # OpenMP runtimes loaded in the process.
-          - label: issue-44-stack
-            python: '3.11.14'
-            conda-packages: llvm-openmp=21.1.8
-            pip-packages: >-
-              numba==0.63.1 llvmlite==0.46.0 numpy==2.3.5 scipy==1.17.0 scikit-learn==1.8.0 pandas==3.0.0
-              xarray==2025.12.0 pyarrow torch==2.10.0 pytest setuptools-scm
     env:
       PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0"
     defaults:
@@ -105,15 +88,12 @@ jobs:
         with:
           miniforge-version: latest
           activate-environment: bridgescaler
-          python-version: ${{ matrix.python }}
+          python-version: '3.13'
           channels: conda-forge
           conda-remove-defaults: "true"
       - name: Install dependencies
         run: |
-          conda install -y ${{ matrix.conda-packages }}
-          if [ -n "${{ matrix.pip-packages }}" ]; then
-            python -m pip install ${{ matrix.pip-packages }}
-          fi
+          conda install -y numpy scipy pandas scikit-learn xarray pyarrow pytest setuptools-scm numba pytorch
           python -m pip install .
           conda list | grep -Ei "numba|llvmlite|openmp|numpy|scikit|torch"
       - name: Environment info
