@@ -14,14 +14,29 @@ permissions:
   pull-requests: write
   statuses: write
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  build-linux:
-    runs-on: ubuntu-latest
+  test:
+    name: pip / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
-      max-parallel: 5
+      fail-fast: false
+      matrix:
+        # macos-latest is Apple Silicon (arm64). pip numba on macOS has no OpenMP runtime, so it uses the
+        # workqueue threading layer; the omp layer is covered by the conda job below.
+        os: [ubuntu-latest, macos-latest]
+    env:
+      # GitHub's macOS runners have little GPU memory; let the MPS tests use what there is.
+      PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0"
     defaults:
       run:
-        shell: bash -l {0}
+        # Not a login shell: on macOS that reorders PATH so Homebrew's (externally managed) Python shadows
+        # the one from setup-python, and `uv pip install --system` then refuses to install (PEP 668).
+        shell: bash
     steps:
       - uses: actions/checkout@v6
       - name: Setup Python
@@ -30,19 +45,59 @@ jobs:
           python-version: '3.13'
           cache: 'pip'
       - name: Install dependencies
-        run: | 
+        run: |
           python -m pip install --upgrade uv
-          uv pip install torch --system --index-url https://download.pytorch.org/whl/cpu
-          uv pip install ".[develop]" --system 
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            uv pip install torch --system --index-url https://download.pytorch.org/whl/cpu
+          else
+            # The PyPI macOS wheels are the ones with MPS support.
+            uv pip install torch --system
+          fi
+          uv pip install ".[develop]" --system
           uv pip install ruff pytest --system
       - name: Lint with ruff
+        if: runner.os == 'Linux'
         run: |
           # stop the build if there are Python syntax errors or undefined names
           ruff check --select=E9,F63,F7,F82 --exit-zero
           # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
           ruff check --output-format concise --exit-zero
           # Checking documentation errors
-          ruff check  --select=D  --exit-zero --statistics 
+          ruff check  --select=D  --exit-zero --statistics
+      - name: Environment info
+        run: python .github/ci_env_info.py
       - name: Test with pytest
         run: |
-          pytest
+          pytest -rs
+
+  test-macos-conda:
+    # conda-forge numba links llvm-openmp, so numba can use its omp threading layer here, which the pip job
+    # cannot. macos-15 complements the pip job's macos-latest.
+    name: conda / macos-15
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.0"
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Setup Miniforge
+        uses: conda-incubator/setup-miniconda@v4
+        with:
+          miniforge-version: latest
+          activate-environment: bridgescaler
+          python-version: '3.13'
+          channels: conda-forge
+          conda-remove-defaults: "true"
+      - name: Install dependencies
+        run: |
+          conda install -y numpy scipy pandas scikit-learn xarray pyarrow pytest setuptools-scm numba pytorch
+          python -m pip install .
+          conda list | grep -Ei "numba|llvmlite|openmp|numpy|scikit|torch"
+      - name: Environment info
+        run: python .github/ci_env_info.py
+      - name: Test with pytest
+        run: |
+          pytest -rs

@@ -1110,3 +1110,42 @@ def test_dspatial_standard_scaler_legacy_saved_counts(tmp_path):
         torch.testing.assert_close(merged.mean_x_, reference.mean_x_, rtol=1e-6, atol=1e-6)
         torch.testing.assert_close(merged.var_x_, reference.var_x_, rtol=1e-6, atol=1e-6)
         assert merged.transform(_named(x_b.clone(), names)).dtype == torch.float32
+
+
+_MPS_SCALERS = [DStandardScalerTensor, DSpatialStandardScalerTensor, DMinMaxScalerTensor, DQuantileScalerTensor]
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS not available")
+@pytest.mark.parametrize("scaler_cls", _MPS_SCALERS, ids=lambda c: c.__name__)
+def test_tensor_scaler_mps_matches_cpu(scaler_cls):
+    """Fitting on MPS gives the same scaler as fitting on the CPU (issue #44).
+
+    Moving MPS stats to the CPU as float64 in one ``.to(device=..., dtype=...)`` call raises on
+    torch <= 2.13 and silently returns zeros on torch 2.14, so this covers the first fit, a refit
+    (the merge path) and ``__add__``.
+    """
+    torch.manual_seed(44)
+    x_a = torch.randn(8, 6, 7, 3) * torch.tensor([5.0, 0.1, 300.0]) + torch.tensor([10.0, -2.0, 1000.0])
+    x_b = torch.randn(5, 6, 7, 3) * torch.tensor([4.0, 0.2, 250.0]) + torch.tensor([11.0, -1.5, 1100.0])
+    cpu_a, cpu_b, mps_a, mps_b = scaler_cls(), scaler_cls(), scaler_cls(), scaler_cls()
+    cpu_a.fit(x_a)
+    cpu_b.fit(x_b)
+    mps_a.fit(x_a.to("mps"))
+    mps_b.fit(x_b.to("mps"))
+    stat_names = [name for name in ("mean_x_", "var_x_", "n_", "min_x_", "max_x_") if hasattr(cpu_a, name)]
+
+    def check(cpu_scaler, mps_scaler):
+        for name in stat_names:
+            expected, actual = getattr(cpu_scaler, name), getattr(mps_scaler, name)
+            torch.testing.assert_close(torch.as_tensor(actual).cpu().double(), torch.as_tensor(expected).double(),
+                                       rtol=1e-5, atol=1e-5, msg=f"{scaler_cls.__name__}.{name}")
+        for x in (x_a, x_b):
+            out = mps_scaler.transform(x.to("mps"))
+            assert out.device.type == "mps"
+            torch.testing.assert_close(out.cpu(), cpu_scaler.transform(x), rtol=1e-4, atol=1e-4)
+
+    check(cpu_a, mps_a)
+    check(cpu_a + cpu_b, mps_a + mps_b)
+    cpu_a.fit(x_b)
+    mps_a.fit(x_b.to("mps"))
+    check(cpu_a, mps_a)

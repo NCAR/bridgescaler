@@ -1,9 +1,13 @@
 import os
+import subprocess
+import sys
+import textwrap
 
 import numpy as np
 import pytest
 
 import tdigest_cases as tc
+import bridgescaler
 from bridgescaler.tdigest import TDigest
 from bridgescaler.distributed import DQuantileScaler, tdigest_cdf, tdigest_quantile
 
@@ -215,9 +219,17 @@ def test_tdigest_api_edge_cases():
     assert np.array_equal(clone.centroids(), td.centroids()) and clone.size() == td.size()
 
 
+@pytest.fixture(params=["numba", "threads"])
+def parallel_mode(request, monkeypatch):
+    """Run a test with TDigestArrays in each parallel mode, whatever this platform's default is."""
+    import bridgescaler.tdigest
+    monkeypatch.setattr(bridgescaler.tdigest, "PARALLEL_MODE", request.param)
+    return request.param
+
+
 @pytest.mark.parametrize("channel_axis", [-1, 1])
 @pytest.mark.parametrize("dtype", [np.float64, np.float32])
-def test_tdigest_arrays_match_per_channel(channel_axis, dtype):
+def test_tdigest_arrays_match_per_channel(channel_axis, dtype, parallel_mode):
     """The prange batch fit/merge equals one TDigest per channel, fit on ``np.take(x, i, axis).ravel()``."""
     from bridgescaler.tdigest import TDigestArrays
     rng = np.random.default_rng(4)
@@ -240,7 +252,7 @@ def test_tdigest_arrays_match_per_channel(channel_axis, dtype):
                            np.array(tc.to_state(td)[1:]), f"channel {i}")
 
 
-def test_tdigest_arrays_merge_targets():
+def test_tdigest_arrays_merge_targets(parallel_mode):
     from bridgescaler.tdigest import TDigestArrays
     rng = np.random.default_rng(6)
     x = rng.normal(size=(5000, 5))
@@ -282,3 +294,60 @@ def test_dquantile_scaler_add_subset_columns():
         ref = tc.to_state(td)
         assert_state_equal((combined.centroids_[i], combined.size_[i], combined.min_[i], combined.max_[i]),
                            ref[0], np.array(ref[1:]), col)
+
+
+# Run in a child process so a crash inside a numba kernel fails one test instead of killing pytest.
+_THREADING_LAYER_SCRIPT = textwrap.dedent("""
+    import sys
+    import numpy as np
+    import numba
+    from bridgescaler.tdigest import TDigest, TDigestArrays
+
+    rng = np.random.default_rng(44)
+    # The shape and compression from issue #44, which segfaulted under the omp layer on macOS.
+    x = rng.random((2, 4, 121, 240))
+    other = rng.random((2, 4, 121, 240))
+    try:
+        fit = TDigestArrays.fit(x, compression=500.0, channel_axis=1)
+    except ValueError as err:
+        if "threading layer" in str(err):
+            print(err)
+            sys.exit(3)
+        raise
+    fit.merge(TDigestArrays.fit(other, compression=500.0, channel_axis=1))
+    centroids, sizes, mins, maxs = fit.to_states()
+    for i in range(x.shape[1]):
+        td = TDigest(500.0)
+        td.update(x[:, i])
+        td.centroids()  # flush, as TDigestArrays.fit does
+        td2 = TDigest(500.0)
+        td2.update(other[:, i])
+        td.merge(td2)
+        c = td.centroids()
+        assert np.array_equal(centroids[i], np.stack([c["mean"], c["weight"]], axis=1)), i
+        assert sizes[i] == td.size() and mins[i] == td.min() and maxs[i] == td.max(), i
+    try:
+        print("layer", numba.threading_layer())
+    except ValueError:  # the thread-pool mode never starts numba's threading layer
+        print("layer none")
+""")
+
+
+@pytest.mark.parametrize("layer", ["omp", "workqueue", "tbb"])
+def test_tdigest_arrays_threading_layers(layer, tmp_path):
+    """TDigestArrays fit and merge run and match the serial TDigest whatever NUMBA_THREADING_LAYER is set to.
+
+    Issue #44: on macOS, numba's omp layer segfaulted when another libomp (pip scikit-learn's) was already loaded,
+    so there TDigestArrays uses a thread pool and must not start numba's threading layer at all."""
+    env = dict(os.environ, NUMBA_THREADING_LAYER=layer, NUMBA_CACHE_DIR=str(tmp_path / "numba_cache"))
+    package_root = os.path.dirname(os.path.dirname(os.path.abspath(bridgescaler.__file__)))
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [package_root, env.get("PYTHONPATH")]))
+    proc = subprocess.run([sys.executable, "-c", _THREADING_LAYER_SCRIPT], env=env, capture_output=True, text=True,
+                          timeout=600)
+    if proc.returncode == 3:
+        pytest.skip(f"numba threading layer {layer!r} is not available: {proc.stdout.strip()}")
+    assert proc.returncode == 0, (f"child exited with {proc.returncode} under NUMBA_THREADING_LAYER={layer}\n"
+                                  f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}")
+    from bridgescaler.tdigest import PARALLEL_MODE
+    expected = "layer none" if PARALLEL_MODE == "threads" else f"layer {layer}"
+    assert expected in proc.stdout, proc.stdout

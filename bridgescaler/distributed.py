@@ -599,7 +599,7 @@ class DQuantileScaler(DBaseScaler):
         x_columns, is_array = self.extract_x_columns(x, channels_last=self.channels_last)
         xv = self.extract_array(x)
         channel_dim = self.set_channel_dim()
-        # one digest per variable, fit in parallel over variables (numba prange)
+        # one digest per variable, fit in parallel over variables (see bridgescaler.tdigest.PARALLEL_MODE)
         new_td_arrays = TDigestArrays.fit(xv, self.compression, channel_axis=channel_dim)
         if not self._fit:
             self.x_columns_ = x_columns
